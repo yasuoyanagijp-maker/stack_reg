@@ -1,7 +1,7 @@
 import flet as ft
 from app.ui.dashboard import create_dashboard
 
-def main(page: ft.Page):
+async def main(page: ft.Page):
     # 1. Native Window Configuration (Premium Feel)
     page.title = "ARIAKE OCTA Stack Registration"
     page.theme_mode = ft.ThemeMode.DARK

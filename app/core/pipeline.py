@@ -18,6 +18,31 @@ from app.core.registration import (
     average_project_stack
 )
 
+def discover_visits(input_dir: str):
+    """
+    Auto-detects whether the input_dir is a Patient directory (containing multiple Visits)
+    or a Visit directory (containing Layers).
+    """
+    subfolders = sorted([f for f in os.listdir(input_dir) if os.path.isdir(os.path.join(input_dir, f))])
+    if not subfolders:
+        return []
+    
+    first_sub = os.path.join(input_dir, subfolders[0])
+    has_images = any(f.lower().endswith(('.tif', '.tiff', '.jpg', '.jpeg')) for f in os.listdir(first_sub))
+    if has_images:
+        return [input_dir] # It's a Visit dir
+    
+    # It's a Patient dir - find all valid Visit subdirectories
+    visits = []
+    for sf in subfolders:
+        visit_dir = os.path.join(input_dir, sf)
+        visit_subs = [f for f in os.listdir(visit_dir) if os.path.isdir(os.path.join(visit_dir, f))]
+        if visit_subs:
+            fs = os.path.join(visit_dir, visit_subs[0])
+            if any(f.lower().endswith(('.tif', '.tiff', '.jpg', '.jpeg')) for f in os.listdir(fs)):
+                visits.append(visit_dir)
+    return visits
+
 def run_registration_pipeline(
     input_dir: str, 
     output_dir: str, 
@@ -27,14 +52,7 @@ def run_registration_pipeline(
 ):
     """
     Orchestrates the entire OCTA Registration process with strict parity 
-    to the ImageJ macro logic.
-    
-    This function:
-    1. Validates the folder structure and file order.
-    2. Builds the 'Image 5' reference stack (Stack of Averages).
-    3. Calculates registration transformations on the reference stack.
-    4. Applies transformations and optimized enhancement to all other layers.
-    5. Saves averaged results as TIFFs.
+    to the ImageJ macro logic, supporting both single Visit and full Patient structures.
     """
     
     def log(msg: str):
@@ -48,81 +66,99 @@ def run_registration_pipeline(
             progress_callback(val, status)
 
     log("--- Starting Pipeline ---")
-    progress(0.05, "Validating folder structure...")
+    progress(0.05, "Scanning directory structure...")
     
-    # 1. Validation
-    is_valid, msg, folder_contents = validate_folder_structure(input_dir)
-    if not is_valid:
-        log(f"ERROR: {msg}")
+    visits = discover_visits(input_dir)
+    if not visits:
+        log("ERROR: No valid Visit folders found. Expected a folder containing visits, or a visit containing layers.")
         return False
-    log(msg)
 
-    # Ensure output directory exists (patient folder)
     patient_name = os.path.basename(input_dir.rstrip(os.sep))
     patient_output_dir = os.path.join(output_dir, patient_name)
     if not os.path.exists(patient_output_dir):
         os.makedirs(patient_output_dir)
         log(f"Created output subdirectory: {patient_output_dir}")
 
-    # 2. Step 1: Create 'Image 5' Reference Stack (Stack of Averages)
-    progress(0.15, "Building Image 5 Reference Stack...")
-    try:
-        ref_stack = create_reference_stack_image5(input_dir, folder_contents)
-        log(f"Image 5 reference stack created. Slices: {ref_stack.shape[0]}")
-    except Exception as e:
-        log(f"ERROR creating reference stack: {str(e)}")
-        return False
-
-    # 3. Step 2 & 3: Optimization & Registration Calculation
-    progress(0.35, "Optimizing CLAHE parameters...")
-    middle_idx = ref_stack.shape[0] // 2
-    best_params = optimize_clahe_parameters(ref_stack[middle_idx])
-    b, h, s = best_params
-    log(f"Optimized CLAHE set to: Block={b}, Slope={s}")
-
-    progress(0.45, "Calculating Affine registration matrices...")
-    matrices = calculate_affine_transformations(ref_stack)
-    log("Transformation calculation complete.")
-
-    # 4. Step 4: Apply to all folders and save results
-    sorted_folders = sorted(folder_contents.keys())
-    total_folders = len(sorted_folders)
+    total_visits = len(visits)
     
-    for idx, folder_name in enumerate(sorted_folders):
-        log(f"Processing Layer {idx+1}/{total_folders}: {folder_name}...")
-        progress(0.5 + (0.4 * (idx / total_folders)), f"Processing {folder_name}...")
+    for v_idx, visit_dir in enumerate(visits):
+        visit_name = os.path.basename(visit_dir.rstrip(os.sep))
+        log(f"\n--- Processing Visit {v_idx+1}/{total_visits}: {visit_name} ---")
         
-        # Build original stack for this layer
-        image_files = folder_contents[folder_name]
-        raw_stack = []
-        for filename in image_files:
-            file_path = os.path.join(input_dir, folder_name, filename)
-            img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
-            # Match 4x enlargement
-            raw_stack.append(enlarge_image_4x(img))
+        base_prog = (v_idx / total_visits)
+        v_scale = 1.0 / total_visits
         
-        stack_array = np.stack(raw_stack, axis=0)
+        # 1. Validation for this Visit
+        progress(base_prog + (0.05 * v_scale), f"[{visit_name}] Validating structure...")
+        is_valid, msg, folder_contents = validate_folder_structure(visit_dir)
+        if not is_valid:
+            log(f"ERROR in {visit_name}: {msg}")
+            return False
+        log(f"  {msg}")
+
+        # 2. Step 1: Create 'Image 5' Reference Stack (Stack of Averages)
+        progress(base_prog + (0.15 * v_scale), f"[{visit_name}] Building Reference Stack...")
+        try:
+            ref_stack = create_reference_stack_image5(visit_dir, folder_contents)
+            log(f"  Image 5 reference stack created. Slices: {ref_stack.shape[0]}")
+        except Exception as e:
+            log(f"ERROR creating reference stack for {visit_name}: {str(e)}")
+            return False
+
+        # 3. Step 2 & 3: Optimization & Registration Calculation
+        progress(base_prog + (0.35 * v_scale), f"[{visit_name}] Optimizing CLAHE...")
+        middle_idx = ref_stack.shape[0] // 2
+        best_params = optimize_clahe_parameters(ref_stack[middle_idx])
+        b, h, s = best_params
+        log(f"  Optimized CLAHE set to: Block={b}, Slope={s}")
+
+        progress(base_prog + (0.45 * v_scale), f"[{visit_name}] Calculating Affine matrices...")
+        matrices = calculate_affine_transformations(ref_stack)
+        log("  Transformation calculation complete.")
+
+        # 4. Step 4: Apply to all layers and save results
+        sorted_captures = sorted(folder_contents.keys())
+        total_captures = len(sorted_captures)
+        total_layers = len(folder_contents[sorted_captures[0]])
         
-        # Apply transformation matrices from Image 5
-        registered_stack = apply_transformations_to_stack(stack_array, matrices)
-        
-        # Final enhancement with optimized CLAHE
-        # Matches ImageJ logic: applies to slices 2-n by default or ALL if requested
-        if apply_clahe_to_ref or idx > 0:
-            log(f"  Enhancing {folder_name} with optimized CLAHE...")
-            for s_idx in range(registered_stack.shape[0]):
-                registered_stack[s_idx] = apply_clahe(registered_stack[s_idx], clip_limit=s, tile_size=b)
-        
-        # Average Intensity Projection
-        avg_img = average_project_stack(registered_stack)
-        
-        # Save as TIFF
-        output_filename = f"{patient_name}-Avg-{folder_name}.tif"
-        output_filepath = os.path.join(patient_output_dir, output_filename)
-        tifffile.imwrite(output_filepath, avg_img)
-        log(f"  Saved Average Projection: {output_filename}")
+        for layer_idx in range(total_layers):
+            log(f"  Processing Layer {layer_idx+1}/{total_layers}...")
+            progress(base_prog + ((0.5 + (0.4 * (layer_idx / total_layers))) * v_scale), f"[{visit_name}] Processing Layer {layer_idx+1}...")
+            
+            # Build original stack for this specific layer across all captures
+            raw_stack = []
+            for cap_idx, capture_folder in enumerate(sorted_captures):
+                image_files = folder_contents[capture_folder]
+                filename = image_files[layer_idx]
+                
+                file_path = os.path.join(visit_dir, capture_folder, filename)
+                img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+                
+                # Match 4x enlargement
+                raw_stack.append(enlarge_image_4x(img))
+            
+            stack_array = np.stack(raw_stack, axis=0)
+            
+            # Apply transformation matrices from Image 5
+            registered_stack = apply_transformations_to_stack(stack_array, matrices)
+            
+            # Final enhancement with optimized CLAHE
+            # Matches ImageJ logic: applies to slices 2-n by default or ALL if requested
+            if apply_clahe_to_ref or layer_idx > 0:
+                for s_idx in range(registered_stack.shape[0]):
+                    registered_stack[s_idx] = apply_clahe(registered_stack[s_idx], clip_limit=s, tile_size=b)
+            
+            # Average Intensity Projection
+            avg_img = average_project_stack(registered_stack)
+            
+            # Formulate output filename matching the ImageJ manual format exactly
+            # Format: 患者名-Avg-Stack_Visit1_image1.tif
+            output_filename = f"{patient_name}-Avg-Stack_{visit_name}_image{layer_idx+1}.tif"
+            output_filepath = os.path.join(patient_output_dir, output_filename)
+            tifffile.imwrite(output_filepath, avg_img)
+            log(f"    Saved: {output_filename}")
 
     progress(1.0, "Completed successfully.")
-    log("--- Pipeline Finished ---")
+    log("\n--- Pipeline Finished ---")
     return True
 

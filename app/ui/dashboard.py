@@ -18,7 +18,7 @@ def create_dashboard(page: ft.Page):
     output_path = ft.Text("No directory selected", color=ft.Colors.GREY_400)
     progress_bar = ft.ProgressBar(width=None, value=0, color=ft.Colors.CYAN_400, bgcolor=ft.Colors.GREY_800)
     progress_text = ft.Text("Ready", size=14, color=ft.Colors.CYAN_200)
-    log_messages = ft.ListView(expand=True, spacing=5, padding=10)
+    log_messages = ft.ListView(expand=True, spacing=5, padding=10, auto_scroll=True)
     
     # --- File Pickers (v0.84: Service, not visual control) ---
     input_picker = ft.FilePicker()
@@ -29,20 +29,19 @@ def create_dashboard(page: ft.Page):
     # --- Helper Functions ---
     def add_log(message: str, color=ft.Colors.WHITE):
         log_messages.controls.append(ft.Text(message, color=color, size=13))
-        log_messages.scroll_to(offset=-1, duration=500)
         log_messages.update()
 
-    def select_input_dir(e):
+    async def select_input_dir(e):
         """Opens the native directory picker for the input folder."""
-        result = input_picker.get_directory_path(dialog_title="Select Input Directory")
+        result = await input_picker.get_directory_path(dialog_title="Select Input Directory")
         if result:
             input_path.value = result
             input_path.update()
             add_log(f"Input directory set to: {result}")
 
-    def select_output_dir(e):
+    async def select_output_dir(e):
         """Opens the native directory picker for the output folder."""
-        result = output_picker.get_directory_path(dialog_title="Select Output Directory")
+        result = await output_picker.get_directory_path(dialog_title="Select Output Directory")
         if result:
             output_path.value = result
             output_path.update()
