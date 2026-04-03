@@ -1,0 +1,10 @@
+# .gitignore for ARIAKE OCTA Registration
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.spec
+.DS_Store

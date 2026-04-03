@@ -1,0 +1,29 @@
+# Flet Specific Rules
+
+We are using Flet v0.84+ and Python 3.14.
+
+## Naming Conventions (Material 3)
+- Avoid using deprecated lowercase module attributes like `ft.colors` or `ft.icons`.
+- Use uppercase Enum classes: `ft.Colors`, `ft.Icons`, `ft.Border`, `ft.Margin`.
+- Specifically:
+    - `ft.colors.` -> `ft.Colors.`
+    - `ft.icons.` -> `ft.Icons.`
+    - `ft.border.` -> `ft.Border.`
+    - `ft.margin.` -> `ft.Margin.`
+
+## FilePicker API (CRITICAL - v0.84 Breaking Change)
+- `FilePicker` constructor accepts ONLY `on_upload`. No `on_result`, `on_select`, or any other event handler.
+- `get_directory_path()` is **synchronous** and returns `str | None` directly.
+- `pick_files()` is **synchronous** and returns `list[FilePickerFile]` directly.
+- `save_file()` is **synchronous** and returns `str | None` directly.
+- The picker must be added to `page.services` (NOT `page.overlay`). FilePicker is a Service, not a visual control.
+
+## App Initialization
+- `ft.app()` is deprecated. Use `ft.run(main)` instead.
+
+## ColorScheme (Material 3)
+- `background` argument is removed. Use `surface` instead.
+- `on_background` argument is removed. Use `on_surface` instead.
+
+## UI Rendering
+- Ensure `page.add()` or `page.controls.append()` is followed by `page.update()` for proper UI rendering.

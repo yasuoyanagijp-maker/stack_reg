@@ -1,0 +1,7 @@
+flet
+opencv-python
+numpy
+tifffile
+scikit-image
+pillow
+pyinstaller
