@@ -28,8 +28,11 @@ def create_dashboard(page: ft.Page):
 
     # --- Helper Functions ---
     def add_log(message: str, color=ft.Colors.WHITE):
+        if len(log_messages.controls) > 150:
+            log_messages.controls.pop(0)
         log_messages.controls.append(ft.Text(message, color=color, size=13))
         log_messages.update()
+        page.update()
 
     async def select_input_dir(e):
         """Opens the native directory picker for the input folder."""
@@ -46,42 +49,6 @@ def create_dashboard(page: ft.Page):
             output_path.value = result
             output_path.update()
             add_log(f"Output directory set to: {result}")
-
-    def start_processing(e):
-        if input_path.value == "No directory selected" or output_path.value == "No directory selected":
-            page.snack_bar = ft.SnackBar(ft.Text("Please select both input and output directories!"))
-            page.snack_bar.open = True
-            page.update()
-            return
-        
-        # Start the pipeline in a background thread
-        def run_thread():
-            def progress_cb(val, status):
-                progress_bar.value = val
-                progress_text.value = status
-                page.update()
-
-            def log_cb(msg):
-                add_log(msg)
-
-            success = run_registration_pipeline(
-                input_path.value, 
-                output_path.value, 
-                progress_callback=progress_cb, 
-                log_callback=log_cb
-            )
-            
-            if success:
-                add_log("--- All Tasks Completed! ---", color=ft.Colors.GREEN_400)
-                page.snack_bar = ft.SnackBar(ft.Text("Registration successful!"))
-                page.snack_bar.open = True
-            else:
-                add_log("--- Error Occurred! ---", color=ft.Colors.RED_400)
-            
-            page.update()
-
-        thread = threading.Thread(target=run_thread, daemon=True)
-        thread.start()
 
     # --- UI Components ---
     
@@ -117,17 +84,68 @@ def create_dashboard(page: ft.Page):
     )
 
     # Settings Section
+    clahe_layer1_switch = ft.Switch(label="Apply CLAHE to Layer 1 (Standard Reference)", value=False)
+    auto_tuning_switch = ft.Switch(label="Automate Parameter Tuning", value=True)
+    
     settings_card = ft.Card(
         content=ft.Container(
             content=ft.Column([
                 ft.Text("Processing Settings", size=18, weight=ft.FontWeight.BOLD),
-                ft.Switch(label="Apply CLAHE to Layer 1 (Standard Reference)", value=False),
-                ft.Switch(label="Automate Parameter Tuning", value=True),
+                clahe_layer1_switch,
+                auto_tuning_switch,
             ], spacing=10),
             padding=15,
         ),
         margin=ft.Margin.all(10),
     )
+
+    def start_processing(e):
+        if input_path.value == "No directory selected" or output_path.value == "No directory selected":
+            page.snack_bar = ft.SnackBar(ft.Text("Please select both input and output directories!"))
+            page.snack_bar.open = True
+            page.update()
+            return
+        
+        # Capture current switch states
+        apply_clahe_val = clahe_layer1_switch.value
+        auto_tuning_val = auto_tuning_switch.value
+        
+        # Start the pipeline in a background thread
+        def run_thread():
+            import time
+            def progress_cb(val, status):
+                progress_bar.value = val
+                progress_text.value = status
+                progress_bar.update()
+                progress_text.update()
+                page.update()
+                time.sleep(0.005) # Tiny yield to allow Flet socket flush
+
+            def log_cb(msg):
+                add_log(msg)
+                page.update()
+                time.sleep(0.005) # Tiny yield to allow Flet socket flush
+
+            success = run_registration_pipeline(
+                input_path.value, 
+                output_dir=output_path.value, 
+                apply_clahe_to_ref=apply_clahe_val,
+                automate_tuning=auto_tuning_val,
+                progress_callback=progress_cb, 
+                log_callback=log_cb
+            )
+            
+            if success:
+                add_log("--- All Tasks Completed! ---", color=ft.Colors.GREEN_400)
+                page.snack_bar = ft.SnackBar(ft.Text("Registration successful!"))
+                page.snack_bar.open = True
+            else:
+                add_log("--- Error Occurred! ---", color=ft.Colors.RED_400)
+            
+            page.update()
+
+        thread = threading.Thread(target=run_thread, daemon=True)
+        thread.start()
 
     # Progress & Logs Section
     log_card = ft.Container(

@@ -3,7 +3,7 @@ import numpy as np
 import os
 import logging
 import math
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Callable
 
 def enlarge_image_4x(image: np.ndarray) -> np.ndarray:
     """
@@ -40,22 +40,36 @@ def subtract_background_rolling_ball(image: np.ndarray, radius: int = 50) -> np.
     # Top-hat = original - opening (morphology opening removes bright structures smaller than kernel)
     return cv2.morphologyEx(image, cv2.MORPH_TOPHAT, kernel)
 
-def apply_clahe(image: np.ndarray, clip_limit: float = 3.0, tile_size: int = 127) -> np.ndarray:
+def apply_clahe(
+    image: np.ndarray,
+    clip_limit: float = 3.0,
+    block_size: int = 127,
+    nbins: int = 256,
+) -> np.ndarray:
     """
     Applies Contrast Limited Adaptive Histogram Equalization (CLAHE).
     Matches ImageJ's "Enhance Local Contrast".
-    
-    Args:
-        image: Grayscale image.
-        clip_limit: The maximum slope of the histogram contrast.
-        tile_size: The grid size for histogram calculation (blocksize).
-        
-    Returns:
-        Enhanced image.
+
+    OpenCV uses a tile grid; ImageJ blocksize is the target local window size in pixels.
+    Using ceil keeps tile edges closer to block_size than floor (especially when
+    width/height are not multiples of block_size).
+
+    For nbins=128, ImageJ builds a 128-bin histogram; we approximate by halving
+    levels before CLAHE and doubling after (256-bin CLAHE on compressed data).
     """
-    # OpenCV uses tileGridSize as (rows, cols)
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
-    return clahe.apply(image)
+    h, w = image.shape[:2]
+
+    num_tiles_x = max(1, math.ceil(w / block_size))
+    num_tiles_y = max(1, math.ceil(h / block_size))
+
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(num_tiles_x, num_tiles_y))
+    if nbins == 256:
+        return clahe.apply(image)
+    if nbins == 128:
+        comp = (image.astype(np.uint16) >> 1).astype(np.uint8)
+        out = clahe.apply(comp)
+        return np.clip(out.astype(np.uint16) << 1, 0, 255).astype(np.uint8)
+    raise ValueError(f"nbins must be 128 or 256, got {nbins}")
 
 def pretreat(image: np.ndarray) -> np.ndarray:
     """
@@ -81,7 +95,8 @@ def pretreat(image: np.ndarray) -> np.ndarray:
     img = subtract_background_rolling_ball(image, radius=50)
     
     # 2. CLAHE (Local Contrast Enhancement)
-    img = apply_clahe(img, clip_limit=3.0, tile_size=127)
+    # ImageJ standard blocksize is 127 pixels for pretreatment.
+    img = apply_clahe(img, clip_limit=3.0, block_size=127, nbins=256)
     
     # 3. Gaussian Blur (sigma=2)
     # kernel size for sigma=2 is typically (2*sigma*3 + 1) which is ~13x13
@@ -89,7 +104,11 @@ def pretreat(image: np.ndarray) -> np.ndarray:
     
     return img
 
-def create_reference_stack_image5(main_dir: str, folder_contents: Dict[str, List[str]]) -> np.ndarray:
+def create_reference_stack_image5(
+    main_dir: str, 
+    folder_contents: Dict[str, List[str]],
+    progress_callback: Optional[Callable[[float, str], None]] = None
+) -> np.ndarray:
     """
     Creates the 'Image 5' reference stack as described in the original ImageJ macro.
     
@@ -103,6 +122,7 @@ def create_reference_stack_image5(main_dir: str, folder_contents: Dict[str, List
     Args:
         main_dir: The path containing the sub-folders.
         folder_contents: Dictionary of folder names to list of image filenames.
+        progress_callback: Optional progress reporter for UI.
         
     Returns:
         A 3D NumPy array representing the 'Image 5' reference stack.
@@ -114,13 +134,22 @@ def create_reference_stack_image5(main_dir: str, folder_contents: Dict[str, List
     
     # Sort folders to ensure consistent stack order
     sorted_folders = sorted(folder_contents.keys())
+    total_folders = len(sorted_folders)
     
-    for folder_name in sorted_folders:
+    for f_idx, folder_name in enumerate(sorted_folders):
         logger.info(f"  Processing folder: {folder_name}")
         image_files = folder_contents[folder_name]
+        total_files = len(image_files)
         
         temp_stack = []
-        for filename in image_files:
+        for i_idx, filename in enumerate(image_files):
+            # Granular progress within Step 1 (Folders)
+            if progress_callback:
+                # Sub-progress within the current folder
+                folder_prog = f_idx / total_folders
+                inner_prog = (i_idx / total_files) / total_folders
+                progress_callback(folder_prog + inner_prog, f"Building Image 5: {folder_name} ({i_idx+1}/{total_files})...")
+
             file_path = os.path.join(main_dir, folder_name, filename)
             
             # Read image as grayscale
@@ -199,21 +228,27 @@ def optimize_clahe_parameters(image: np.ndarray) -> Tuple[int, int, float]:
     """
     logger = logging.getLogger(__name__)
     
-    # Parameters to test (from original macro)
+    # Parameters to test (from ImageJ macro lines 409-411)
+    # blocksize is in PIXELS
     blocksizes = [8, 16, 32]
     hist_bins_array = [128, 256]
     max_slopes = [2.0, 3.0, 4.0]
-    
+
     best_score = -1.0
-    best_params = (16, 256, 3.0) # Defaults
-    
-    logger.info("Starting grid search for optimal CLAHE parameters...")
-    
+    # ImageJ Defaults (lines 414-416)
+    best_params = (16, 256, 3.0)
+
+    logger.info(
+        "Finding optimal CLAHE parameters (ImageJ parity: blocks %s, bins %s, slopes %s)...",
+        blocksizes,
+        hist_bins_array,
+        max_slopes,
+    )
+
     for b in blocksizes:
         for h in hist_bins_array:
             for s in max_slopes:
-                # Apply CLAHE with current parameters
-                test_img = apply_clahe(image, clip_limit=s, tile_size=b)
+                test_img = apply_clahe(image, clip_limit=s, block_size=b, nbins=h)
                 
                 # Calculate quality
                 score = calculate_quality_score(test_img)
@@ -222,7 +257,7 @@ def optimize_clahe_parameters(image: np.ndarray) -> Tuple[int, int, float]:
                     best_score = score
                     best_params = (b, h, s)
                     
-    logger.info(f"Optimal parameters found: Block={best_params[0]}, Bins={best_params[1]}, "
+    logger.info(f"Optimal parameters found: BlockSize={best_params[0]}px, Bins={best_params[1]}, "
                 f"Slope={best_params[2]} (Score: {best_score:.4f})")
                 
     return best_params

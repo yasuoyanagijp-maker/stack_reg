@@ -47,6 +47,7 @@ def run_registration_pipeline(
     input_dir: str, 
     output_dir: str, 
     apply_clahe_to_ref: bool = False,
+    automate_tuning: bool = True,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None
 ):
@@ -97,33 +98,47 @@ def run_registration_pipeline(
         log(f"  {msg}")
 
         # 2. Step 1: Create 'Image 5' Reference Stack (Stack of Averages)
-        progress(base_prog + (0.15 * v_scale), f"[{visit_name}] Building Reference Stack...")
+        def image5_progress_cb(inner_val, inner_status):
+            # Scale Image 5 progress into the 10%-25% range of the visit scale
+            visit_image5_prog = 0.10 + (inner_val * 0.15)
+            progress(base_prog + (visit_image5_prog * v_scale), f"[{visit_name}] {inner_status}")
+
         try:
-            ref_stack = create_reference_stack_image5(visit_dir, folder_contents)
+            ref_stack = create_reference_stack_image5(visit_dir, folder_contents, progress_callback=image5_progress_cb)
             log(f"  Image 5 reference stack created. Slices: {ref_stack.shape[0]}")
         except Exception as e:
             log(f"ERROR creating reference stack for {visit_name}: {str(e)}")
             return False
 
-        # 3. Step 2 & 3: Optimization & Registration Calculation
-        progress(base_prog + (0.35 * v_scale), f"[{visit_name}] Optimizing CLAHE...")
-        middle_idx = ref_stack.shape[0] // 2
-        best_params = optimize_clahe_parameters(ref_stack[middle_idx])
-        b, h, s = best_params
-        log(f"  Optimized CLAHE set to: Block={b}, Slope={s}")
+        # 3. Step 2 & 3: Registration (CLAHE tuning runs per layer on warped data — ImageJ parity)
+        progress(base_prog + (0.25 * v_scale), f"[{visit_name}] Computing alignment...")
 
-        progress(base_prog + (0.45 * v_scale), f"[{visit_name}] Calculating Affine matrices...")
-        matrices = calculate_affine_transformations(ref_stack)
-        log("  Transformation calculation complete.")
+        # Integration of granular alignment progress (40% -> 70%)
+        def alignment_progress_cb(inner_val, inner_status):
+            # Scale alignment progress into the 40%-70% range of the visit scale
+            visit_aligned_prog = 0.40 + (inner_val * 0.30)
+            progress(base_prog + (visit_aligned_prog * v_scale), f"[{visit_name}] {inner_status}")
 
-        # 4. Step 4: Apply to all layers and save results
+        matrices = calculate_affine_transformations(
+            ref_stack, 
+            progress_callback=alignment_progress_cb,
+            log_callback=log
+        )
+        
+        # [Verify Matrices Alignment]: matrices[0] should be Identity
+        if not np.allclose(matrices[0], np.eye(2, 3)):
+            log("  [WARN] Alignment Anchor (Slice 1) is not Identity. Results may be shifted.")
+
+        # 4. Step 4: Apply to all layers and save results (70% -> 100%)
         sorted_captures = sorted(folder_contents.keys())
         total_captures = len(sorted_captures)
         total_layers = len(folder_contents[sorted_captures[0]])
         
         for layer_idx in range(total_layers):
+            layer_weight = 1.0 / total_layers
+            layer_base = 0.70 + (layer_idx * layer_weight * 0.30)
+            
             log(f"  Processing Layer {layer_idx+1}/{total_layers}...")
-            progress(base_prog + ((0.5 + (0.4 * (layer_idx / total_layers))) * v_scale), f"[{visit_name}] Processing Layer {layer_idx+1}...")
             
             # Build original stack for this specific layer across all captures
             raw_stack = []
@@ -138,21 +153,48 @@ def run_registration_pipeline(
                 raw_stack.append(enlarge_image_4x(img))
             
             stack_array = np.stack(raw_stack, axis=0)
-            
+            num_slices = stack_array.shape[0]
+
+            # Nested callback for Warping (0% - 50% of layer progress)
+            def layer_warp_cb(inner_val, inner_status):
+                p = layer_base + (inner_val * 0.5 * layer_weight * 0.30)
+                progress(base_prog + (p * v_scale), f"[{visit_name}] L{layer_idx+1}: {inner_status}")
+
             # Apply transformation matrices from Image 5
-            registered_stack = apply_transformations_to_stack(stack_array, matrices)
-            
-            # Final enhancement with optimized CLAHE
-            # Matches ImageJ logic: applies to slices 2-n by default or ALL if requested
+            registered_stack = apply_transformations_to_stack(stack_array, matrices, progress_callback=layer_warp_cb)
+
+            # Final enhancement with optimized CLAHE (50% - 90% of layer progress)
+            # ImageJ optimizes on the middle slice of each registered stack, not the Image 5 reference.
             if apply_clahe_to_ref or layer_idx > 0:
-                for s_idx in range(registered_stack.shape[0]):
-                    registered_stack[s_idx] = apply_clahe(registered_stack[s_idx], clip_limit=s, tile_size=b)
+                mid_slice = (num_slices + 1) // 2 - 1
+                if automate_tuning:
+                    progress(
+                        base_prog + ((layer_base + 0.5 * layer_weight * 0.30) * v_scale),
+                        f"[{visit_name}] L{layer_idx+1}: Finding optimal CLAHE...",
+                    )
+                    b, h, s = optimize_clahe_parameters(registered_stack[mid_slice])
+                    log(f"  Layer {layer_idx + 1} CLAHE: BlockSize={b}px, Bins={h}, Slope={s}")
+                else:
+                    b, h, s = (32, 256, 4.0)
+                    log(f"  Layer {layer_idx + 1} CLAHE (fixed): BlockSize={b}px, Bins={h}, Slope={s}")
+
+                for s_idx in range(num_slices):
+                    clahe_p = layer_base + (0.5 * layer_weight * 0.30) + (
+                        (s_idx / num_slices) * 0.4 * layer_weight * 0.30
+                    )
+                    progress(
+                        base_prog + (clahe_p * v_scale),
+                        f"[{visit_name}] L{layer_idx+1}: Enhancing {s_idx+1}/{num_slices}...",
+                    )
+                    registered_stack[s_idx] = apply_clahe(
+                        registered_stack[s_idx], clip_limit=s, block_size=b, nbins=h
+                    )
             
-            # Average Intensity Projection
+            # Average Intensity Projection (90% - 100%)
+            progress(base_prog + ( (layer_base + 0.9 * layer_weight * 0.30) * v_scale ), f"[{visit_name}] L{layer_idx+1}: Averaging...")
             avg_img = average_project_stack(registered_stack)
             
-            # Formulate output filename matching the ImageJ manual format exactly
-            # Format: 患者名-Avg-Stack_Visit1_image1.tif
+            # Save
             output_filename = f"{patient_name}-Avg-Stack_{visit_name}_image{layer_idx+1}.tif"
             output_filepath = os.path.join(patient_output_dir, output_filename)
             tifffile.imwrite(output_filepath, avg_img)
