@@ -12,7 +12,7 @@ Retinal OCTA 画像スタックのレジストレーションと平均化のた�
 ## 要件
 
 - **Python 3.14**（推奨。プロジェクトは 3.14 前提で開発）
-- 依存関係: `requirements.txt`
+- 依存関係: `requirements.txt`（現行 venv に合わせ `pip freeze` でバージョン固定）
 
 仮想環境（`venv/`、`.venv/` など）とキャッシュ類は `.gitignore` で除外されています。
 
