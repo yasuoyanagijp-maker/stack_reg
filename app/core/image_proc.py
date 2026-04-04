@@ -5,6 +5,11 @@ import logging
 import math
 from typing import Optional, List, Dict, Tuple, Callable
 
+# ImageJ "Enhance Local Contrast (CLAHE)" maximum slope vs OpenCV createCLAHE clipLimit
+# are not 1:1; using the same numeric value in OpenCV yields much brighter images.
+# Empirically, clipLimit ~= maximum/8 matches ImageJ output mean on the same warped data.
+IJ_MAXIMUM_SLOPE_TO_OPENCV_CLIP = 1.0 / 8.0
+
 def enlarge_image_4x(image: np.ndarray) -> np.ndarray:
     """
     Enlarges the image to 4 times its original size using Bicubic interpolation.
@@ -45,10 +50,18 @@ def apply_clahe(
     clip_limit: float = 3.0,
     block_size: int = 127,
     nbins: int = 256,
+    *,
+    map_imagej_maximum_to_opencv_clip: bool = True,
 ) -> np.ndarray:
     """
     Applies Contrast Limited Adaptive Histogram Equalization (CLAHE).
     Matches ImageJ's "Enhance Local Contrast".
+
+    ``clip_limit`` follows ImageJ's "maximum" (slope) parameter from the macro.
+    When ``map_imagej_maximum_to_opencv_clip`` is True (default), it is converted to
+    OpenCV's ``clipLimit`` via ``IJ_MAXIMUM_SLOPE_TO_OPENCV_CLIP`` so brightness
+    matches ImageJ. The CLAHE parameter search uses ``map_imagej_maximum_to_opencv_clip=False``
+    so the same entropy score landscape ranks (block, bins, slope) like ImageJ.
 
     OpenCV uses a tile grid; ImageJ blocksize is the target local window size in pixels.
     Using ceil keeps tile edges closer to block_size than floor (especially when
@@ -62,7 +75,12 @@ def apply_clahe(
     num_tiles_x = max(1, math.ceil(w / block_size))
     num_tiles_y = max(1, math.ceil(h / block_size))
 
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(num_tiles_x, num_tiles_y))
+    if map_imagej_maximum_to_opencv_clip:
+        cv_clip = float(np.clip(clip_limit * IJ_MAXIMUM_SLOPE_TO_OPENCV_CLIP, 0.01, 40.0))
+    else:
+        cv_clip = float(clip_limit)
+
+    clahe = cv2.createCLAHE(clipLimit=cv_clip, tileGridSize=(num_tiles_x, num_tiles_y))
     if nbins == 256:
         return clahe.apply(image)
     if nbins == 128:
@@ -96,7 +114,13 @@ def pretreat(image: np.ndarray) -> np.ndarray:
     
     # 2. CLAHE (Local Contrast Enhancement)
     # ImageJ standard blocksize is 127 pixels for pretreatment.
-    img = apply_clahe(img, clip_limit=3.0, block_size=127, nbins=256)
+    img = apply_clahe(
+        img,
+        clip_limit=3.0,
+        block_size=127,
+        nbins=256,
+        map_imagej_maximum_to_opencv_clip=True,
+    )
     
     # 3. Gaussian Blur (sigma=2)
     # kernel size for sigma=2 is typically (2*sigma*3 + 1) which is ~13x13
@@ -248,7 +272,13 @@ def optimize_clahe_parameters(image: np.ndarray) -> Tuple[int, int, float]:
     for b in blocksizes:
         for h in hist_bins_array:
             for s in max_slopes:
-                test_img = apply_clahe(image, clip_limit=s, block_size=b, nbins=h)
+                test_img = apply_clahe(
+                    image,
+                    clip_limit=s,
+                    block_size=b,
+                    nbins=h,
+                    map_imagej_maximum_to_opencv_clip=False,
+                )
                 
                 # Calculate quality
                 score = calculate_quality_score(test_img)

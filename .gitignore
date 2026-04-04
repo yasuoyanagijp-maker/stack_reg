@@ -1,10 +1,29 @@
-# .gitignore for ARIAKE OCTA Registration
+# Virtual environments
 venv/
+.venv/
+env/
+ENV/
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+
+# Build / packaging
 dist/
 build/
 *.spec
+
+# OS / editor
 .DS_Store
+
+# Caches & tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Temporary / scratch outputs (local experiments)
+*.tmp
+*.temp
+diff_*.jpg

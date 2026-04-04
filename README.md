@@ -1,54 +1,80 @@
 # ARIAKE OCTA Stack Registration Tool
 
-A professional-grade desktop application for registering and averaging retinal OCTA image stacks. This tool is a direct Python translation of the ARIAKE ImageJ macro, optimized for standalone performance and ease of use.
+Retinal OCTA 画像スタックのレジストレーションと平均化のためのデスクトップアプリです。ARIAKE ImageJ マクロの Python 実装をベースに、単体実行と操作性を重視しています。
 
-## Features
-- **Strict Parity**: Matches ImageJ's preprocessing, 4x enlargement, and CLAHE optimization exactly.
-- **Reference-Based Alignment**: Uses the "Stack of Averages" (Image 5) method for high-precision Affine registration.
-- **Data Validation**: Automatically verifies file order and consistency across all patient folders.
-- **Premium UI**: Built with Flet (Flutter) for a modern, responsive, and cross-platform experience.
+## 機能
 
-## Installation
+- **ImageJ との整合**: 前処理、4 倍拡大、CLAHE 最適化などを ImageJ の挙動に合わせて再現。
+- **参照ベースのアライメント**: 「平均スタック（画像 5）」方式による Affine レジストレーション。
+- **データ検証**: 患者フォルダ間でファイル順序と整合性を自動確認。
+- **UI**: Flet によるモダンなクロスプラットフォーム UI。
 
-1. **Clone the repository**:
+## 要件
+
+- **Python 3.14**（推奨。プロジェクトは 3.14 前提で開発）
+- 依存関係: `requirements.txt`
+
+仮想環境（`venv/`、`.venv/` など）とキャッシュ類は `.gitignore` で除外されています。
+
+## インストール
+
+1. **リポジトリを取得**:
    ```bash
    git clone <repository-url>
    cd stack_reg
    ```
 
-2. **Set up a virtual environment**:
+2. **仮想環境**:
    ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   python3.14 -m venv venv
+   source venv/bin/activate   # Windows: venv\Scripts\activate
    ```
 
-3. **Install dependencies**:
+3. **依存関係のインストール**:
    ```bash
    pip install -r requirements.txt
    ```
 
-## Running the Application
+## 実行
 
-To start the app in development mode:
+開発モードでアプリを起動:
+
 ```bash
 python -m app.main
 ```
 
-## Packaging for Desktop (.exe / .dmg)
+## デスクトップ向けパッケージ（.exe / .dmg）
 
-This application uses `flet build` to create native standalone executables.
+`flet build` でネイティブ実行ファイルを作成できます。
 
 ### Windows (.exe)
+
 ```bash
 flet build windows
 ```
 
 ### macOS (.dmg)
+
 ```bash
 flet build macos
 ```
 
-The output will be located in the `build/` directory.
+成果物は `build/` 配下に出力されます（`build/` は Git 対象外）。
+
+## プロジェクト構成（概要）
+
+| パス | 内容 |
+|------|------|
+| `app/main.py` | エントリ（`ft.run`） |
+| `app/ui/` | ダッシュボード・QC ビューアなど |
+| `app/core/` | 画像処理・レジストレーション・パイプライン |
+| `archive/` | 開発・検証用スクリプト（アプリ本体からは未使用） |
+
+## 開発メモ
+
+- Flet は **v0.84+** を想定（`FilePicker` は `page.services` に追加するなど API 変更あり）。
+- UI / API の細則は `.cursorrules` を参照。
 
 ---
+
 Developed by Team Yanagi (2025/2026)
