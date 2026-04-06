@@ -10,6 +10,9 @@ def build_gaussian_pyramid(img: np.ndarray, min_size: int = 64) -> List[np.ndarr
     
     Using cv2.pyrDown provides Gaussian smoothing before downsampling, 
     which is essential for anti-aliasing in registration.
+    
+    Setting min_size=64 (default) results in approximately 4 levels for 512x512 images,
+    providing a robust balance between structural capture and detail preservation.
     """
     pyramid = [img]
     while True:
@@ -29,11 +32,14 @@ def calculate_affine_transformations(
     Calculates the Affine transformation matrix for each slice in the 
     reference stack relative to the first slice.
     
-    This rigidly adheres to the 'Phase 1: Align' step of ImageJ's MultiStackReg
-    using Marquardt-Levenberg multi-resolution Gaussian Pyramids.
+    High-Precision Pyramid Logic (for Perfect Peripheral Alignment):
+    1.  Initial Seed: `cv2.matchTemplate` at the coarsest level for global position.
+    2.  Full Affine Refinement: Use `cv2.MOTION_AFFINE` at ALL pyramid levels for maximum 
+        precision across the entire image field, especially at the periphery.
+    3.  Tighter Convergence: 200 iterations and 1e-5 epsilon to ensure "perfect" snapping.
     
     Args:
-        reference_stack: A 3D NumPy array (Slices, Height, Width) representing Image 5.
+        reference_stack: A 3D NumPy array (Slices, Height, Width).
         
     Returns:
         A list of 2x3 Affine transformation matrices.
@@ -41,20 +47,18 @@ def calculate_affine_transformations(
     logger = logging.getLogger(__name__)
     num_slices = reference_stack.shape[0]
     
-    # [IMPORTANT] Ensure matrices list starts with an Identity matrix for Slice 0 (Anchor).
-    # This ensures Stack_VisitX_image1..4 all match Capture 1 as the reference point.
+    # Anchor (Slice 0) is always Identity.
     matrices = [np.eye(2, 3, dtype=np.float32)]
     
-    # The first slice is our absolute reference (Anchor)
     target_slice = reference_stack[0].astype(np.float32)
+    # Using min_size=64 for a robust pyramid structure.
     target_pyramid = build_gaussian_pyramid(target_slice, min_size=64)
     num_levels = len(target_pyramid)
     
-    # ECC algorithm parameters (Levenberg-Marquardt style)
-    # 50 iterations and 0.001 epsilon for convergence.
-    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.001)
+    # Increased precision for medical image alignment: 200 iterations, 1e-5 epsilon.
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-5)
     
-    # Scaling matrices for hierarchical translation step-up (M_large = S * M_small * S_inv)
+    # Scaling matrices for hierarchical propagation (M_large = S * M_small * S_inv)
     S = np.array([[2.0, 0.0, 0.0],
                   [0.0, 2.0, 0.0],
                   [0.0, 0.0, 1.0]], dtype=np.float64)
@@ -62,79 +66,75 @@ def calculate_affine_transformations(
                       [0.0, 0.5, 0.0],
                       [0.0, 0.0, 1.0]], dtype=np.float64)
                       
-    logger.info(f"Starting Multi-resolution Affine alignment ({num_levels} pyramid levels) on {num_slices} slices...")
-    print(f"\n[Alignment] Phase 1: Calculating transformation parameters ({num_levels} levels)...")
+    logger.info(f"Starting Precision Multi-resolution Registration ({num_levels} levels) on {num_slices} slices...")
     
     total_alignments = num_slices - 1
     for i in range(1, num_slices):
         source_slice = reference_stack[i].astype(np.float32)
         source_pyramid = build_gaussian_pyramid(source_slice, min_size=64)
         
-        # Ensure pyramids have the same depth
         effective_levels = min(num_levels, len(source_pyramid))
         
-        # Initialize the warp matrix as identity for the coarsest level
+        # Initial guess (Identity)
         warp_matrix = np.eye(2, 3, dtype=np.float32)
         
-        # Traverse pyramid from Coarse (small image) to Fine (large real image)
-        for level_idx, level in enumerate(reversed(range(effective_levels))):
-            # Calculate granular progress for this level
-            msg = f"Aligning Slice {i+1}/{num_slices} (Level {level})..."
+        # Pyramid traversal: Coarse (small image) -> Fine (large image)
+        for level_idx, level_res in enumerate(reversed(range(effective_levels))):
+            curr_target = target_pyramid[level_res]
+            curr_source = source_pyramid[level_res]
+            
+            msg = f"Aligning Slice {i+1}/{num_slices} [Level {level_res}]"
             if progress_callback:
                 level_prog = ((i - 1) / total_alignments) + (level_idx / (effective_levels * total_alignments))
                 progress_callback(level_prog, msg)
-            
-            # Send message to Journal in UI
-            if log_callback:
-                log_callback(f"  {msg}")
 
-            curr_target = target_pyramid[level]
-            curr_source = source_pyramid[level]
-            
             try:
-                # 1. ECCで縮小画像同士のズレを計算 (Target -> Source coordinate mapping)
-                (cc, warp_matrix) = cv2.findTransformECC(
+                # --- Step A: INITIAL SEED (Only at the coarsest level) ---
+                if level_idx == 0:
+                    # use matchTemplate to find the best integer translation initial guess
+                    res = cv2.matchTemplate(curr_source, curr_target, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                    
+                    if max_val > 0.4:
+                        # Translate current source by max_loc to align with target
+                        warp_matrix[0, 2] = float(max_loc[0])
+                        warp_matrix[1, 2] = float(max_loc[1])
+
+                # --- Step B: PRECISION AFFINE REFINEMENT ---
+                # MOTION_AFFINE is used throughout to ensure edges align as well as the center.
+                (cc, new_warp) = cv2.findTransformECC(
                     curr_target, curr_source, warp_matrix, 
                     cv2.MOTION_AFFINE, criteria
                 )
-                logger.info(f"  Slice {i} Level {level} alignment (Correlation: {cc:.4f})")
+                warp_matrix = new_warp
                 
-                # Consistently log to the console at key levels
-                if level == 0 or level == effective_levels - 1:
-                    status_line = f"  Slice {i}/{num_slices-1} Level {level} (Res: {curr_target.shape[1]}x{curr_target.shape[0]}, Corr: {cc:.4f})"
-                    print(status_line)
+                if level_res == 0 or level_res == effective_levels - 1:
+                    status_line = f"  Slice {i} Lev {level_res} CC: {cc:.4f} (Precision Affine)"
+                    logger.info(status_line)
                     if log_callback:
                         log_callback(status_line)
                 
-            except cv2.error as e:
-                err_msg = f"  [WARN] Slice {i} Level {level} did not converge. Using coarse estimate."
+            except cv2.error:
+                # If ECC fails at a level, stick with the estimate from the previous level.
+                err_msg = f"  [WARN] Slice {i} Lev {level_res} failed. Keeping previous estimate."
                 logger.warning(err_msg)
-                print(err_msg)
                 if log_callback:
                     log_callback(err_msg)
-                # Keep the warp_matrix from the previous (coarser) level as the best estimate
                 pass
             
-            # 【重要】高精度なスケーリング処理 (M_large = S * M_small * S^-1)
-            # Propagate the transformation to the next higher resolution level
-            if level > 0:
+            # Step-up scaling for next resolution level
+            if level_res > 0:
                 M_3x3 = np.vstack([warp_matrix.astype(np.float64), [0.0, 0.0, 1.0]])
                 M_scaled = S @ M_3x3 @ S_inv
                 warp_matrix = M_scaled[:2, :].astype(np.float32)
         
         matrices.append(warp_matrix)
         
-        # Final progress for this fully completed slice
-        done_msg = f"Slice {i+1}/{num_slices} Aligned."
         if progress_callback:
-            progress_callback(i / total_alignments, done_msg)
-        if log_callback:
-            log_callback(f"  [OK] {done_msg}")
+            progress_callback(i / total_alignments, f"Slice {i+1}/{num_slices} Aligned.")
         
-        # Memory Management: Clear the source pyramid before next slice
         del source_pyramid
         
-    # Memory Management: Clear the target pyramid
     del target_pyramid
     
     print("  Alignment calculation complete.\n")
