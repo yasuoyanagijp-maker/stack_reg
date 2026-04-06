@@ -1,6 +1,9 @@
 import flet as ft
 import os
 import threading
+import sys
+import contextlib
+import time
 from app.core.pipeline import run_registration_pipeline
 
 def create_dashboard(page: ft.Page):
@@ -30,9 +33,19 @@ def create_dashboard(page: ft.Page):
     def add_log(message: str, color=ft.Colors.WHITE):
         if len(log_messages.controls) > 150:
             log_messages.controls.pop(0)
-        log_messages.controls.append(ft.Text(message, color=color, size=13))
+        log_messages.controls.append(ft.Text(message, color=color, size=13, font_family="Consolas"))
         log_messages.update()
         page.update()
+
+    class JournalRedirector:
+        def __init__(self, color=ft.Colors.CYAN_200):
+            self.color = color
+        def write(self, data):
+            if data and data.strip():
+                # Add terminal lines to Journal
+                add_log(f"  > {data.strip()}", color=self.color)
+        def flush(self):
+            pass
 
     async def select_input_dir(e):
         """Opens the native directory picker for the input folder."""
@@ -112,28 +125,27 @@ def create_dashboard(page: ft.Page):
         
         # Start the pipeline in a background thread
         def run_thread():
-            import time
             def progress_cb(val, status):
                 progress_bar.value = val
                 progress_text.value = status
                 progress_bar.update()
                 progress_text.update()
                 page.update()
-                time.sleep(0.005) # Tiny yield to allow Flet socket flush
 
             def log_cb(msg):
                 add_log(msg)
                 page.update()
-                time.sleep(0.005) # Tiny yield to allow Flet socket flush
 
-            success = run_registration_pipeline(
-                input_path.value, 
-                output_dir=output_path.value, 
-                apply_clahe_to_ref=apply_clahe_val,
-                automate_tuning=auto_tuning_val,
-                progress_callback=progress_cb, 
-                log_callback=log_cb
-            )
+            # Capture stdout (print statements from core) into the journal
+            with contextlib.redirect_stdout(JournalRedirector()):
+                success = run_registration_pipeline(
+                    input_path.value, 
+                    output_dir=output_path.value, 
+                    apply_clahe_to_ref=apply_clahe_val,
+                    automate_tuning=auto_tuning_val,
+                    progress_callback=progress_cb, 
+                    log_callback=log_cb
+                )
             
             if success:
                 add_log("--- All Tasks Completed! ---", color=ft.Colors.GREEN_400)
