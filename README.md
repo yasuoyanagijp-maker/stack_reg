@@ -49,9 +49,47 @@ python -m app.main
 
 ### Windows (.exe)
 
-```bash
-flet build windows
+**前提（初回のみ）**
+
+1. 仮想環境を有効化し、依存関係をインストール済みであること（[インストール](#インストール)参照）。
+2. **開発者モードを ON** にする（Flutter プラグインのシンボリックリンクに必要）。  
+   `Win + I` → **システム** → **開発者向け** → **開発者モード** をオン。  
+   または PowerShell で設定を開く: `start ms-settings:developers`
+3. 初回ビルド時は Flutter SDK が自動ダウンロードされます（数 GB、時間がかかります）。
+
+**ビルド**
+
+```powershell
+cd c:\Users\Y\stack_reg
+.\scripts\build_windows.ps1
 ```
+
+手動で実行する場合（コンソールは UTF-8 推奨）:
+
+```powershell
+chcp 65001
+$env:PYTHONUTF8 = "1"
+$env:FLET_CLI_NO_RICH_OUTPUT = "1"
+.\venv\Scripts\flet.exe build windows --yes --no-rich-output
+```
+
+**配布用パッケージ（推奨）**
+
+```powershell
+.\scripts\build_windows.ps1
+```
+
+成果物:
+
+| 種類 | パス |
+|------|------|
+| フォルダ（そのまま配布可） | `dist\ARIAKE_OCTA_Stack_Registration_v0.1.0_win64\` |
+| ZIP（配布用） | `dist\ARIAKE_OCTA_Stack_Registration_v0.1.0_win64.zip` |
+
+エンドユーザーは ZIP を解凍し、`ARIAKE_OCTA_Stack_Registration.exe` を実行します（Python 不要）。
+
+中間ビルド成果物は `build\flutter\build\windows\x64\runner\Release\` にもあります。
+`flet build` の INSTALL 段階は VC ランタイム DLL の都合でスクリプトが自動修復します。
 
 ### macOS (.dmg)
 
