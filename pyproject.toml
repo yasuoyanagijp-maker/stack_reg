@@ -1,0 +1,26 @@
+[project]
+name = "stack-reg"
+version = "0.1.0"
+description = "ARIAKE OCTA Stack Registration Tool"
+requires-python = ">=3.10"
+dependencies = [
+    "flet==0.84.0",
+    "flet-desktop==0.84.0",
+    "numpy==2.4.4",
+    "opencv-python==4.13.0.92",
+    "pillow==12.2.0",
+    "scikit-image==0.26.0",
+    "scipy==1.17.1",
+    "tifffile==2026.3.3",
+    "ImageIO==2.37.3",
+    "networkx==3.6.1",
+    "lazy-loader==0.5",
+]
+
+[tool.flet]
+org = "jp.teamyanagi"
+product = "ARIAKE OCTA Stack Registration"
+
+[tool.flet.app]
+module = "main"
+exclude = ["venv", "archive", ".git", "build", "ARIAKE_Stack_Reg_J.ijm"]

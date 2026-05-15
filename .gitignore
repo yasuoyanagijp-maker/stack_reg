@@ -10,13 +10,15 @@ __pycache__/
 *.pyo
 *.egg-info/
 
-# Build / packaging
+# Build / packaging (flet build, PyInstaller, local dist zip)
 dist/
 build/
 *.spec
 
 # OS / editor
 .DS_Store
+Thumbs.db
+desktop.ini
 
 # Caches & tooling
 .pytest_cache/
