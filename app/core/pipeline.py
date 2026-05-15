@@ -1,16 +1,15 @@
-import cv2
 import numpy as np
 import os
 import logging
 import tifffile
 from typing import Callable, Optional
-from app.core.validation import validate_folder_structure
+from app.core.validation import validate_folder_structure, validate_images_readable
 from app.core.image_proc import (
-    create_reference_stack_image5, 
-    optimize_clahe_parameters, 
-    enlarge_image_4x, 
-    pretreat, 
-    apply_clahe
+    create_reference_stack_image5,
+    optimize_clahe_parameters,
+    enlarge_image_4x,
+    imread_grayscale,
+    apply_clahe,
 )
 from app.core.registration import (
     calculate_affine_transformations, 
@@ -97,6 +96,13 @@ def run_registration_pipeline(
             return False
         log(f"  {msg}")
 
+        progress(base_prog + (0.08 * v_scale), f"[{visit_name}] Checking image files...")
+        readable, read_msg = validate_images_readable(visit_dir, folder_contents)
+        if not readable:
+            log(f"ERROR in {visit_name}: {read_msg}")
+            return False
+        log(f"  {read_msg}")
+
         # 2. Step 1: Create 'Image 5' Reference Stack (Stack of Averages)
         def image5_progress_cb(inner_val, inner_status):
             # Scale Image 5 progress into the 10%-25% range of the visit scale
@@ -139,21 +145,26 @@ def run_registration_pipeline(
             layer_base = 0.70 + (layer_idx * layer_weight * 0.30)
             
             log(f"  Processing Layer {layer_idx+1}/{total_layers}...")
-            
+            log(f"    Loading {total_captures} captures (4x enlarge)...")
+
             # Build original stack for this specific layer across all captures
             raw_stack = []
             for cap_idx, capture_folder in enumerate(sorted_captures):
                 image_files = folder_contents[capture_folder]
                 filename = image_files[layer_idx]
-                
                 file_path = os.path.join(visit_dir, capture_folder, filename)
-                img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
-                
-                # Match 4x enlargement
+                log(f"    Capture {cap_idx + 1}/{total_captures}: {filename}")
+
+                img = imread_grayscale(file_path)
+                if img is None:
+                    log(f"ERROR: Failed to read: {file_path}")
+                    return False
+
                 raw_stack.append(enlarge_image_4x(img))
             
             stack_array = np.stack(raw_stack, axis=0)
             num_slices = stack_array.shape[0]
+            log(f"    Warping {num_slices} slices...")
 
             # Nested callback for Warping (0% - 50% of layer progress)
             def layer_warp_cb(inner_val, inner_status):
@@ -162,12 +173,14 @@ def run_registration_pipeline(
 
             # Apply transformation matrices from Image 5
             registered_stack = apply_transformations_to_stack(stack_array, matrices, progress_callback=layer_warp_cb)
+            log(f"    Warp complete.")
 
             # Final enhancement with optimized CLAHE (50% - 90% of layer progress)
             # ImageJ optimizes on the middle slice of each registered stack, not the Image 5 reference.
             if apply_clahe_to_ref or layer_idx > 0:
                 mid_slice = (num_slices + 1) // 2 - 1
                 if automate_tuning:
+                    log(f"    Optimizing CLAHE parameters (grid search)...")
                     progress(
                         base_prog + ((layer_base + 0.5 * layer_weight * 0.30) * v_scale),
                         f"[{visit_name}] L{layer_idx+1}: Finding optimal CLAHE...",
@@ -178,6 +191,7 @@ def run_registration_pipeline(
                     b, h, s = (32, 256, 4.0)
                     log(f"  Layer {layer_idx + 1} CLAHE (fixed): BlockSize={b}px, Bins={h}, Slope={s}")
 
+                log(f"    Applying CLAHE to {num_slices} slices...")
                 for s_idx in range(num_slices):
                     clahe_p = layer_base + (0.5 * layer_weight * 0.30) + (
                         (s_idx / num_slices) * 0.4 * layer_weight * 0.30
@@ -189,7 +203,9 @@ def run_registration_pipeline(
                     registered_stack[s_idx] = apply_clahe(
                         registered_stack[s_idx], clip_limit=s, block_size=b, nbins=h
                     )
-            
+            elif layer_idx == 0 and not apply_clahe_to_ref:
+                log(f"    Skipping CLAHE for Layer 1 (reference layer).")
+
             # Average Intensity Projection (90% - 100%)
             progress(base_prog + ( (layer_base + 0.9 * layer_weight * 0.30) * v_scale ), f"[{visit_name}] L{layer_idx+1}: Averaging...")
             avg_img = average_project_stack(registered_stack)

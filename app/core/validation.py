@@ -1,6 +1,8 @@
 import os
 from typing import List, Dict, Tuple
 
+from app.core.image_proc import imread_grayscale
+
 def validate_folder_structure(main_dir: str) -> Tuple[bool, str, Dict[str, List[str]]]:
     """
     Checks if the Capture folders (e.g., 1/, 2/, 3/) contain the correct layers.
@@ -42,6 +44,34 @@ def validate_folder_structure(main_dir: str) -> Tuple[bool, str, Dict[str, List[
                        f"each containing {reference_count} layers.")
     
     return True, summary_message, folder_contents
+
+
+def validate_images_readable(
+    main_dir: str, folder_contents: Dict[str, List[str]], max_report: int = 5
+) -> Tuple[bool, str]:
+    """
+    Verify every listed image can be decoded (catches Windows Unicode path issues early).
+    """
+    unreadable: List[str] = []
+    for folder_name, files in folder_contents.items():
+        for filename in files:
+            path = os.path.join(main_dir, folder_name, filename)
+            if imread_grayscale(path) is None:
+                unreadable.append(path)
+
+    if not unreadable:
+        return True, "All images are readable."
+
+    sample = unreadable[:max_report]
+    extra = len(unreadable) - len(sample)
+    lines = "\n  ".join(sample)
+    suffix = f"\n  ... and {extra} more." if extra > 0 else ""
+    return False, (
+        f"Cannot read {len(unreadable)} image(s). "
+        "Check that files exist and paths are valid:\n  "
+        f"{lines}{suffix}"
+    )
+
 
 if __name__ == "__main__":
     # Test logic

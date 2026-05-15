@@ -1,7 +1,4 @@
 import flet as ft
-import os
-import threading
-import sys
 import contextlib
 import time
 from app.core.pipeline import run_registration_pipeline
@@ -29,21 +26,56 @@ def create_dashboard(page: ft.Page):
     page.services.append(input_picker)
     page.services.append(output_picker)
 
-    # --- Helper Functions ---
-    def add_log(message: str, color=ft.Colors.WHITE):
+    # --- Helper Functions (UI updates must run on the page event loop — Flet 0.84+) ---
+    def append_log_line(message: str, color=ft.Colors.WHITE):
         if len(log_messages.controls) > 150:
             log_messages.controls.pop(0)
-        log_messages.controls.append(ft.Text(message, color=color, size=13, font_family="Consolas"))
+        log_messages.controls.append(
+            ft.Text(message, color=color, size=13, font_family="Consolas")
+        )
+
+    async def ui_log(message: str, color=ft.Colors.WHITE):
+        append_log_line(message, color)
         log_messages.update()
-        page.update()
+
+    async def ui_progress(val: float, status: str):
+        progress_bar.value = val
+        progress_text.value = status
+        progress_bar.update()
+        progress_text.update()
+
+    async def ui_complete(success: bool):
+        if success:
+            append_log_line("--- All Tasks Completed! ---", color=ft.Colors.GREEN_400)
+            page.snack_bar = ft.SnackBar(ft.Text("Registration successful!"))
+            page.snack_bar.open = True
+        else:
+            append_log_line("--- Error Occurred! ---", color=ft.Colors.RED_400)
+        log_messages.update()
+        progress_bar.update()
+        progress_text.update()
+
+    _last_progress_ts = [0.0]
+
+    def schedule_log(message: str, color=ft.Colors.WHITE):
+        page.run_task(ui_log, message, color=color)
+
+    def schedule_progress(val: float, status: str):
+        now = time.monotonic()
+        if val < 1.0 and (now - _last_progress_ts[0]) < 0.15:
+            return
+        _last_progress_ts[0] = now
+        page.run_task(ui_progress, val, status)
+
+    def add_log(message: str, color=ft.Colors.WHITE):
+        schedule_log(message, color=color)
 
     class JournalRedirector:
         def __init__(self, color=ft.Colors.CYAN_200):
             self.color = color
         def write(self, data):
             if data and data.strip():
-                # Add terminal lines to Journal
-                add_log(f"  > {data.strip()}", color=self.color)
+                schedule_log(f"  > {data.strip()}", color=self.color)
         def flush(self):
             pass
 
@@ -123,41 +155,26 @@ def create_dashboard(page: ft.Page):
         apply_clahe_val = clahe_layer1_switch.value
         auto_tuning_val = auto_tuning_switch.value
         
-        # Start the pipeline in a background thread
-        def run_thread():
-            def progress_cb(val, status):
-                progress_bar.value = val
-                progress_text.value = status
-                progress_bar.update()
-                progress_text.update()
-                page.update()
+        _last_progress_ts[0] = 0.0
+        schedule_log("--- Starting registration ---")
 
-            def log_cb(msg):
-                add_log(msg)
-                page.update()
+        def run_pipeline():
+            success = False
+            try:
+                with contextlib.redirect_stdout(JournalRedirector()):
+                    success = run_registration_pipeline(
+                        input_path.value,
+                        output_dir=output_path.value,
+                        apply_clahe_to_ref=apply_clahe_val,
+                        automate_tuning=auto_tuning_val,
+                        progress_callback=schedule_progress,
+                        log_callback=schedule_log,
+                    )
+            except Exception as exc:
+                schedule_log(f"ERROR: {exc}", color=ft.Colors.RED_400)
+            page.run_task(ui_complete, success)
 
-            # Capture stdout (print statements from core) into the journal
-            with contextlib.redirect_stdout(JournalRedirector()):
-                success = run_registration_pipeline(
-                    input_path.value, 
-                    output_dir=output_path.value, 
-                    apply_clahe_to_ref=apply_clahe_val,
-                    automate_tuning=auto_tuning_val,
-                    progress_callback=progress_cb, 
-                    log_callback=log_cb
-                )
-            
-            if success:
-                add_log("--- All Tasks Completed! ---", color=ft.Colors.GREEN_400)
-                page.snack_bar = ft.SnackBar(ft.Text("Registration successful!"))
-                page.snack_bar.open = True
-            else:
-                add_log("--- Error Occurred! ---", color=ft.Colors.RED_400)
-            
-            page.update()
-
-        thread = threading.Thread(target=run_thread, daemon=True)
-        thread.start()
+        page.run_thread(run_pipeline)
 
     # Progress & Logs Section
     log_card = ft.Container(
