@@ -10,6 +10,21 @@ from typing import Optional, List, Dict, Tuple, Callable
 # Empirically, clipLimit ~= maximum/8 matches ImageJ output mean on the same warped data.
 IJ_MAXIMUM_SLOPE_TO_OPENCV_CLIP = 1.0 / 8.0
 
+
+def imread_grayscale(file_path: str) -> Optional[np.ndarray]:
+    """
+    Load a grayscale image. Uses imdecode so Unicode paths work on Windows
+    (cv2.imread fails on non-ASCII paths).
+    """
+    try:
+        data = np.fromfile(file_path, dtype=np.uint8)
+    except OSError:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
+
+
 def enlarge_image_4x(image: np.ndarray) -> np.ndarray:
     """
     Enlarges the image to 4 times its original size using Bicubic interpolation.
@@ -23,6 +38,8 @@ def enlarge_image_4x(image: np.ndarray) -> np.ndarray:
     Returns:
         The enlarged image.
     """
+    if image is None:
+        raise ValueError("Cannot enlarge: image is None (file may have failed to load).")
     h, w = image.shape[:2]
     # In OpenCV, cv2.INTER_CUBIC is equivalent to Bicubic interpolation
     return cv2.resize(image, (w * 4, h * 4), interpolation=cv2.INTER_CUBIC)
@@ -176,12 +193,12 @@ def create_reference_stack_image5(
 
             file_path = os.path.join(main_dir, folder_name, filename)
             
-            # Read image as grayscale
-            # ImageJ's 8-bit conversion is matched here
-            img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+            img = imread_grayscale(file_path)
             if img is None:
-                logger.error(f"Failed to read image: {file_path}")
-                continue
+                raise ValueError(
+                    f"Failed to read image: {file_path}\n"
+                    "If the path contains non-ASCII characters, ensure files exist and are valid JPEG/TIFF."
+                )
             
             # 1. 4x Enlargement
             img_resized = enlarge_image_4x(img)
