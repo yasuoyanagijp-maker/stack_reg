@@ -1,17 +1,31 @@
 import flet as ft
 import contextlib
+import os
 import time
-from app.core.pipeline import run_registration_pipeline
+from app.core.pipeline import (
+    run_registration_pipeline,
+    discover_visits,
+    prepare_visit,
+    finalize_visit,
+)
+from app.core.registration import DEFAULT_CONFIDENCE_THRESHOLD
+from app.core.manual_align import save_session
+from app.ui.manual_align_view import create_manual_align_view
 
-def create_dashboard(page: ft.Page):
+def create_dashboard(page: ft.Page, mount_view=None):
     """
     Creates the main dashboard UI for the ARIAKE OCTA Registration Tool.
-    
+
+    ``mount_view`` (optional) swaps the app's root content to another control,
+    enabling the manual corresponding-point correction screen. When provided, a
+    "Review & Correct" action is exposed alongside the automatic run.
+
     Flet v0.84.0 API Notes:
     - FilePicker.get_directory_path() is now synchronous and returns str|None directly.
     - No on_result / on_select callbacks exist anymore.
     - The picker must be added to page.overlay before use.
     """
+    layout_ref = {}  # holds the dashboard layout so we can navigate back to it
     
     # --- State Variables ---
     input_path = ft.Text("No directory selected", color=ft.Colors.GREY_400)
@@ -176,6 +190,126 @@ def create_dashboard(page: ft.Page):
 
         page.run_thread(run_pipeline)
 
+    # --- Manual corresponding-point review workflow ---
+    review_state = {"plans": []}
+
+    def go_dashboard():
+        if mount_view and layout_ref.get("layout") is not None:
+            mount_view(layout_ref["layout"])
+
+    async def open_manual_view(plans):
+        review_state["plans"] = plans
+        total_low = sum(len(p.low_confidence_indices()) for p in plans)
+        append_log_line(
+            f"Analysis complete: {len(plans)} visit(s). "
+            f"{total_low} capture(s) flagged for review.",
+            color=ft.Colors.AMBER_200 if total_low else ft.Colors.GREEN_400,
+        )
+        log_messages.update()
+        view = create_manual_align_view(
+            page,
+            plans,
+            on_back=go_dashboard,
+            on_finalize=handle_finalize,
+            threshold=DEFAULT_CONFIDENCE_THRESHOLD,
+        )
+        if mount_view:
+            mount_view(view)
+
+    def start_review(e):
+        if input_path.value == "No directory selected" or output_path.value == "No directory selected":
+            page.snack_bar = ft.SnackBar(ft.Text("Please select both input and output directories!"))
+            page.snack_bar.open = True
+            page.update()
+            return
+        _last_progress_ts[0] = 0.0
+        schedule_log("--- Analyzing for review (auto-alignment) ---")
+
+        def work():
+            try:
+                visits = discover_visits(input_path.value)
+                if not visits:
+                    schedule_log("ERROR: No valid Visit folders found.", color=ft.Colors.RED_400)
+                    page.run_task(ui_complete, False)
+                    return
+                plans = []
+                total = len(visits)
+                for v_idx, vd in enumerate(visits):
+                    def prep_cb(val, status, _b=v_idx, _t=total):
+                        schedule_progress((_b + val) / _t, status)
+                    with contextlib.redirect_stdout(JournalRedirector()):
+                        plan = prepare_visit(vd, progress_callback=prep_cb, log_callback=schedule_log)
+                    plans.append(plan)
+                page.run_task(open_manual_view, plans)
+            except Exception as exc:
+                schedule_log(f"ERROR: {exc}", color=ft.Colors.RED_400)
+                page.run_task(ui_complete, False)
+
+        page.run_thread(work)
+
+    def handle_finalize(overrides_by_visit, points_by_visit):
+        plans = review_state["plans"]
+        if not plans:
+            return
+        apply_clahe_val = clahe_layer1_switch.value
+        auto_tuning_val = auto_tuning_switch.value
+        input_dir = input_path.value
+        output_dir = output_path.value
+        _last_progress_ts[0] = 0.0
+        go_dashboard()
+        schedule_log("--- Finalizing with manual corrections ---")
+
+        def work():
+            success = False
+            try:
+                patient_name = os.path.basename(input_dir.rstrip(os.sep))
+                patient_output_dir = os.path.join(output_dir, patient_name)
+                os.makedirs(patient_output_dir, exist_ok=True)
+
+                session = {
+                    "patient": patient_name,
+                    "confidence_threshold": DEFAULT_CONFIDENCE_THRESHOLD,
+                    "visits": {},
+                }
+                total = len(plans)
+                with contextlib.redirect_stdout(JournalRedirector()):
+                    for v_idx, plan in enumerate(plans):
+                        ov = overrides_by_visit.get(plan.visit_name)
+
+                        def fin_cb(val, status, _b=v_idx, _t=total):
+                            schedule_progress((_b + val) / _t, status)
+
+                        ok = finalize_visit(
+                            plan,
+                            patient_name=patient_name,
+                            patient_output_dir=patient_output_dir,
+                            apply_clahe_to_ref=apply_clahe_val,
+                            automate_tuning=auto_tuning_val,
+                            matrix_overrides=ov,
+                            progress_callback=fin_cb,
+                            log_callback=schedule_log,
+                        )
+                        session["visits"][plan.visit_name] = {
+                            "scores": list(plan.scores),
+                            "auto_matrices": [m.tolist() for m in plan.matrices],
+                            "overrides": {str(k): v.tolist() for k, v in (ov or {}).items()},
+                            "points": {
+                                str(k): pt for k, pt in points_by_visit.get(plan.visit_name, {}).items()
+                            },
+                        }
+                        if not ok:
+                            schedule_log(f"ERROR finalizing visit {plan.visit_name}.", color=ft.Colors.RED_400)
+                            break
+                    else:
+                        success = True
+                save_session(patient_output_dir, session)
+                schedule_log(f"Saved alignment session to {patient_output_dir}.")
+            except Exception as exc:
+                schedule_log(f"ERROR: {exc}", color=ft.Colors.RED_400)
+            page.run_task(ui_complete, success)
+
+        page.run_thread(work)
+
     # Progress & Logs Section
     log_card = ft.Container(
         content=ft.Column([
@@ -189,13 +323,26 @@ def create_dashboard(page: ft.Page):
             ),
             ft.Row([progress_text], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             progress_bar,
-            ft.ElevatedButton(
-                "Run Registration", 
-                icon=ft.Icons.PLAY_ARROW, 
-                style=ft.ButtonStyle(bgcolor=ft.Colors.CYAN_700, color=ft.Colors.WHITE),
-                on_click=start_processing,
-                height=50,
-            )
+            ft.Row([
+                ft.ElevatedButton(
+                    "Run Registration",
+                    icon=ft.Icons.PLAY_ARROW,
+                    style=ft.ButtonStyle(bgcolor=ft.Colors.CYAN_700, color=ft.Colors.WHITE),
+                    on_click=start_processing,
+                    height=50,
+                    expand=True,
+                ),
+                ft.OutlinedButton(
+                    "Review & Correct",
+                    icon=ft.Icons.TUNE,
+                    tooltip="Analyze alignment, then manually fix low-confidence captures "
+                            "with corresponding points before finalizing.",
+                    on_click=start_review,
+                    height=50,
+                    expand=True,
+                    visible=mount_view is not None,
+                ),
+            ], spacing=12),
         ], spacing=15),
         padding=20,
         expand=True,
@@ -210,4 +357,5 @@ def create_dashboard(page: ft.Page):
         ], expand=True),
     ], expand=True, spacing=0)
 
+    layout_ref["layout"] = layout
     return layout

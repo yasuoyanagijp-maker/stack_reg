@@ -21,11 +21,19 @@ async def main(page: ft.Page):
         visual_density=ft.VisualDensity.COMFORTABLE,
     )
     
-    # 2. Main Dashboard Layout
-    dashboard = create_dashboard(page)
-    
+    # 2. Root container acting as a simple view host so the dashboard can swap in
+    #    the manual corresponding-point correction screen and back.
+    root = ft.Container(expand=True)
+
+    def mount_view(control):
+        root.content = control
+        page.update()
+
+    dashboard = create_dashboard(page, mount_view=mount_view)
+    root.content = dashboard
+
     # 3. Add to page
-    page.add(dashboard)
+    page.add(root)
     page.update()
 
 if __name__ == "__main__":
