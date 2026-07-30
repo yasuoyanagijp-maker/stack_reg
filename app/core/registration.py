@@ -9,6 +9,10 @@ from typing import List, Tuple, Optional, Callable
 # typically > 0.9; genuinely failed alignments sit well below this.
 DEFAULT_CONFIDENCE_THRESHOLD = 0.80
 
+# A feature-based refinement is only adopted over the intensity-based result when
+# it improves the (identical) alignment-correlation metric by at least this much.
+REFINE_MIN_IMPROVEMENT = 0.02
+
 
 def build_gaussian_pyramid(img: np.ndarray, min_size: int = 64) -> List[np.ndarray]:
     """
@@ -313,6 +317,70 @@ def compute_alignment_cc(
     if denom <= 1e-9:
         return 0.0
     return float(np.clip((a * b).sum() / denom, -1.0, 1.0))
+
+
+def refine_affine_feature_based(
+    reference: np.ndarray,
+    source: np.ndarray,
+    max_features: int = 2000,
+    ratio: float = 0.75,
+    ransac_thresh: float = 5.0,
+    full_affine: bool = False,
+) -> Optional[Tuple[np.ndarray, float]]:
+    """
+    Feature-based (ORB + RANSAC) affine estimate, used as an automatic second
+    attempt for captures where the intensity-based pyramid alignment is
+    unreliable (typically low-SNR source averages where ``matchTemplate`` seeds
+    poorly or ECC settles in a wrong local minimum).
+
+    This is CPU-only and dependency-free (OpenCV), unlike deep-feature methods,
+    and it fails in a *different* way than intensity ECC, so it often recovers
+    captures with large translation/rotation offsets. By default it fits a
+    partial affine (rotation + uniform scale + translation), which preserves
+    vascular geometry for same-eye OCTA averaging; set ``full_affine=True`` to
+    allow shear/anisotropic scale.
+
+    The returned matrix follows the ``WARP_INVERSE_MAP`` convention used
+    throughout this module (reference coords -> source coords), so it is directly
+    interchangeable with the automatic matrices and manual corrections.
+
+    Returns:
+        ``(matrix, cc)`` where ``cc`` is ``compute_alignment_cc`` of the estimate,
+        or ``None`` when too few reliable correspondences are found.
+    """
+    ref = reference.astype(np.uint8)
+    src = source.astype(np.uint8)
+
+    orb = cv2.ORB_create(nfeatures=max_features)
+    kp_ref, des_ref = orb.detectAndCompute(ref, None)
+    kp_src, des_src = orb.detectAndCompute(src, None)
+    if des_ref is None or des_src is None or len(kp_ref) < 3 or len(kp_src) < 3:
+        return None
+
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    knn = matcher.knnMatch(des_ref, des_src, k=2)
+    good = [pair[0] for pair in knn
+            if len(pair) == 2 and pair[0].distance < ratio * pair[1].distance]
+    if len(good) < 3:
+        return None
+
+    ref_pts = np.float32([kp_ref[m.queryIdx].pt for m in good])
+    src_pts = np.float32([kp_src[m.trainIdx].pt for m in good])
+
+    if full_affine:
+        matrix, _ = cv2.estimateAffine2D(
+            ref_pts, src_pts, method=cv2.RANSAC, ransacReprojThreshold=ransac_thresh
+        )
+    else:
+        matrix, _ = cv2.estimateAffinePartial2D(
+            ref_pts, src_pts, method=cv2.RANSAC, ransacReprojThreshold=ransac_thresh
+        )
+    if matrix is None:
+        return None
+
+    matrix = matrix.astype(np.float32)
+    cc = compute_alignment_cc(reference, source, matrix)
+    return matrix, cc
 
 
 def average_project_stack(stack: np.ndarray) -> np.ndarray:
