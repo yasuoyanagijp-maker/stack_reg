@@ -3,6 +3,13 @@ import numpy as np
 import logging
 from typing import List, Tuple, Optional, Callable
 
+# Captures whose finest-level alignment correlation falls below this value are
+# treated as "suspect" and surfaced for optional manual corresponding-point review.
+# ECC MOTION_AFFINE correlation on well-aligned pretreated OCTA averages is
+# typically > 0.9; genuinely failed alignments sit well below this.
+DEFAULT_CONFIDENCE_THRESHOLD = 0.80
+
+
 def build_gaussian_pyramid(img: np.ndarray, min_size: int = 64) -> List[np.ndarray]:
     """
     Builds a multi-level Gaussian pyramid by downsampling until traversing below min_size.
@@ -26,8 +33,9 @@ def build_gaussian_pyramid(img: np.ndarray, min_size: int = 64) -> List[np.ndarr
 def calculate_affine_transformations(
     reference_stack: np.ndarray, 
     progress_callback: Optional[Callable[[float, str], None]] = None,
-    log_callback: Optional[Callable[[str], None]] = None
-) -> List[np.ndarray]:
+    log_callback: Optional[Callable[[str], None]] = None,
+    return_scores: bool = False,
+):
     """
     Calculates the Affine transformation matrix for each slice in the 
     reference stack relative to the first slice.
@@ -40,15 +48,23 @@ def calculate_affine_transformations(
     
     Args:
         reference_stack: A 3D NumPy array (Slices, Height, Width).
+        return_scores: When True, also return a per-slice confidence score
+            (finest-resolution ECC correlation, in roughly 0..1) so callers can
+            flag captures whose automatic alignment is unreliable and route them
+            to manual corresponding-point review.
         
     Returns:
-        A list of 2x3 Affine transformation matrices.
+        A list of 2x3 Affine transformation matrices, or, when ``return_scores``
+        is True, a tuple ``(matrices, scores)`` where ``scores[i]`` is the
+        confidence for slice ``i`` (slice 0, the anchor, is always 1.0).
     """
     logger = logging.getLogger(__name__)
     num_slices = reference_stack.shape[0]
     
     # Anchor (Slice 0) is always Identity.
     matrices = [np.eye(2, 3, dtype=np.float32)]
+    # Confidence per slice; the anchor is a perfect self-match by definition.
+    scores: List[float] = [1.0]
     
     target_slice = reference_stack[0].astype(np.float32)
     # Using min_size=64 for a robust pyramid structure.
@@ -77,6 +93,10 @@ def calculate_affine_transformations(
         
         # Initial guess (Identity)
         warp_matrix = np.eye(2, 3, dtype=np.float32)
+        # Confidence for this slice: the finest-level ECC correlation. Stays low
+        # if ECC never succeeds at full resolution (i.e. the alignment failed).
+        slice_score = 0.0
+        seed_val = 0.0
         
         # Pyramid traversal: Coarse (small image) -> Fine (large image)
         for level_idx, level_res in enumerate(reversed(range(effective_levels))):
@@ -95,6 +115,7 @@ def calculate_affine_transformations(
                     res = cv2.matchTemplate(curr_source, curr_target, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, max_loc = cv2.minMaxLoc(res)
                     
+                    seed_val = float(max_val)
                     if max_val > 0.4:
                         # Translate current source by max_loc to align with target
                         warp_matrix[0, 2] = float(max_loc[0])
@@ -107,6 +128,10 @@ def calculate_affine_transformations(
                     cv2.MOTION_AFFINE, criteria
                 )
                 warp_matrix = new_warp
+
+                # Record the finest-resolution correlation as the slice confidence.
+                if level_res == 0:
+                    slice_score = float(cc)
                 
                 if level_res == 0 or level_res == effective_levels - 1:
                     status_line = f"  Slice {i} Lev {level_res} CC: {cc:.4f} (Precision Affine)"
@@ -129,7 +154,20 @@ def calculate_affine_transformations(
                 warp_matrix = M_scaled[:2, :].astype(np.float32)
         
         matrices.append(warp_matrix)
-        
+        # Fall back to the coarse matchTemplate seed strength when ECC never
+        # produced a finest-level correlation (alignment effectively failed).
+        scores.append(slice_score if slice_score > 0.0 else seed_val)
+
+        if slice_score < DEFAULT_CONFIDENCE_THRESHOLD:
+            warn = (
+                f"  [LOW CONFIDENCE] Slice {i+1} alignment score "
+                f"{scores[-1]:.3f} (< {DEFAULT_CONFIDENCE_THRESHOLD}). "
+                "Consider manual corresponding-point correction."
+            )
+            logger.warning(warn)
+            if log_callback:
+                log_callback(warn)
+
         if progress_callback:
             progress_callback(i / total_alignments, f"Slice {i+1}/{num_slices} Aligned.")
         
@@ -138,6 +176,8 @@ def calculate_affine_transformations(
     del target_pyramid
     
     print("  Alignment calculation complete.\n")
+    if return_scores:
+        return matrices, scores
     return matrices
 
 def apply_transformations_to_stack(
@@ -177,6 +217,103 @@ def apply_transformations_to_stack(
         )
         
     return transformed_stack
+
+def estimate_affine_from_correspondences(
+    reference_points: np.ndarray,
+    source_points: np.ndarray,
+) -> np.ndarray:
+    """
+    Builds a 2x3 Affine matrix from manually-picked corresponding points.
+
+    The returned matrix follows the exact same convention as
+    ``calculate_affine_transformations`` / ``findTransformECC``: it maps
+    *reference* (anchor / slice-0) coordinates to *source* (the slice being
+    aligned) coordinates, so it can be dropped straight into
+    ``apply_transformations_to_stack`` (which uses ``cv2.WARP_INVERSE_MAP``).
+
+    In other words, for each landmark the user clicks the same anatomical
+    feature in the reference image and in the source image; this estimates the
+    transform such that ``M @ [x_ref, y_ref, 1] == [x_src, y_src]``.
+
+    Args:
+        reference_points: (N, 2) array of (x, y) points in the reference image.
+        source_points:    (N, 2) array of matching (x, y) points in the source image.
+
+    Returns:
+        A 2x3 float32 Affine matrix.
+
+    Raises:
+        ValueError: if fewer than 3 correspondences are supplied, the point
+            counts differ, or a stable transform cannot be estimated.
+    """
+    ref = np.asarray(reference_points, dtype=np.float32).reshape(-1, 2)
+    src = np.asarray(source_points, dtype=np.float32).reshape(-1, 2)
+
+    if ref.shape[0] != src.shape[0]:
+        raise ValueError(
+            f"Point counts differ: {ref.shape[0]} reference vs {src.shape[0]} source."
+        )
+    if ref.shape[0] < 3:
+        raise ValueError(
+            f"At least 3 corresponding points are required, got {ref.shape[0]}."
+        )
+
+    if ref.shape[0] == 3:
+        # An exact 3-point affine is fully determined.
+        matrix = cv2.getAffineTransform(ref, src)
+    else:
+        # 4+ points: least-squares fit, robust to a mis-clicked pair.
+        matrix, _inliers = cv2.estimateAffine2D(
+            ref, src, method=cv2.LMEDS, refineIters=50
+        )
+
+    if matrix is None:
+        raise ValueError(
+            "Could not estimate an affine transform from the given points. "
+            "Ensure the points are not collinear and pairs are ordered consistently."
+        )
+
+    return matrix.astype(np.float32)
+
+
+def compute_alignment_cc(
+    reference: np.ndarray,
+    source: np.ndarray,
+    matrix: np.ndarray,
+) -> float:
+    """
+    Scores how well ``matrix`` aligns ``source`` onto ``reference`` using the
+    zero-mean normalized cross-correlation over the region that maps inside the
+    source frame. Higher is better (1.0 == identical). This mirrors the
+    confidence produced by the automatic pyramid alignment so manual results can
+    be compared on the same scale.
+    """
+    h, w = reference.shape[:2]
+    ref = reference.astype(np.float32)
+    src = source.astype(np.float32)
+
+    # Warp source into the reference frame (matrix maps ref->source coords).
+    warped = cv2.warpAffine(
+        src, matrix.astype(np.float32), (w, h),
+        flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+
+    # Only evaluate where the warp actually produced signal, so the black
+    # border introduced by out-of-frame regions does not inflate the score.
+    mask = warped > 0
+    if mask.sum() < 16:
+        return 0.0
+
+    a = ref[mask]
+    b = warped[mask]
+    a = a - a.mean()
+    b = b - b.mean()
+    denom = np.sqrt((a * a).sum() * (b * b).sum())
+    if denom <= 1e-9:
+        return 0.0
+    return float(np.clip((a * b).sum() / denom, -1.0, 1.0))
+
 
 def average_project_stack(stack: np.ndarray) -> np.ndarray:
     """
