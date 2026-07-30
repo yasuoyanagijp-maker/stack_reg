@@ -16,7 +16,10 @@ from app.core.registration import (
     calculate_affine_transformations,
     apply_transformations_to_stack,
     average_project_stack,
+    compute_alignment_cc,
+    refine_affine_feature_based,
     DEFAULT_CONFIDENCE_THRESHOLD,
+    REFINE_MIN_IMPROVEMENT,
 )
 
 
@@ -84,15 +87,67 @@ def _noop_log(msg: str):
     pass
 
 
+def auto_refine_matrices(
+    ref_stack: np.ndarray,
+    matrices: List[np.ndarray],
+    scores: List[float],
+    threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    min_improvement: float = REFINE_MIN_IMPROVEMENT,
+    refine_fn: Callable = refine_affine_feature_based,
+    log: Optional[Callable[[str], None]] = None,
+) -> List[int]:
+    """
+    For every capture whose confidence is below ``threshold``, run ``refine_fn``
+    (feature-based by default) and adopt its matrix only if it beats the current
+    score by more than ``min_improvement`` on the same correlation metric.
+
+    ``matrices`` and ``scores`` are updated in place. Returns the list of capture
+    indices whose matrices were replaced. This is the automatic attempt made
+    before manual corresponding-point correction.
+    """
+    log = log or _noop_log
+    refined: List[int] = []
+    for i in range(1, len(matrices)):
+        if scores[i] >= threshold:
+            continue
+        result = refine_fn(ref_stack[0], ref_stack[i])
+        if result is None:
+            log(f"  [AUTO-REFINE] Capture {i+1}: feature matching found too few points; keeping auto.")
+            continue
+        cand_matrix, cand_cc = result
+        if cand_cc > scores[i] + min_improvement:
+            log(
+                f"  [AUTO-REFINE] Capture {i+1} improved {scores[i]:.3f} -> {cand_cc:.3f} "
+                "(feature-based ORB+RANSAC)."
+            )
+            matrices[i] = np.asarray(cand_matrix, dtype=np.float32)
+            scores[i] = float(cand_cc)
+            refined.append(i)
+        else:
+            log(
+                f"  [AUTO-REFINE] Capture {i+1}: feature-based {cand_cc:.3f} did not beat "
+                f"auto {scores[i]:.3f}; keeping auto."
+            )
+    return refined
+
+
 def prepare_visit(
     visit_dir: str,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
+    auto_refine: bool = True,
 ) -> VisitPlan:
     """
     Phase 1 for a single Visit: validate, build the "Image 5" reference stack and
     compute the automatic per-capture Affine alignment together with a confidence
     score for each capture.
+
+    When ``auto_refine`` is True, any capture whose intensity-based alignment is
+    below the confidence threshold gets an automatic second attempt via a
+    feature-based (ORB + RANSAC) estimate; the better of the two (measured with
+    the same correlation metric) is kept. This is the automatic step tried
+    *before* asking the user for manual corresponding points — only captures that
+    remain below the threshold afterwards are flagged for manual correction.
 
     ``progress_callback`` receives values in ``0.0..1.0`` scoped to this phase.
     Raises ``ValueError`` on validation / IO failures.
@@ -125,7 +180,7 @@ def prepare_visit(
     def align_cb(inner_val, inner_status):
         progress(0.40 + inner_val * 0.60, f"[{visit_name}] {inner_status}")
 
-    matrices, scores = calculate_affine_transformations(
+    matrices, _ecc_scores = calculate_affine_transformations(
         ref_stack,
         progress_callback=align_cb,
         log_callback=log,
@@ -134,6 +189,15 @@ def prepare_visit(
 
     if not np.allclose(matrices[0], np.eye(2, 3)):
         log("  [WARN] Alignment Anchor (Slice 1) is not Identity. Results may be shifted.")
+
+    # Use a single, consistent correlation metric for every capture so automatic,
+    # feature-refined and manual results are all comparable on the same scale.
+    scores = [1.0]
+    for i in range(1, len(matrices)):
+        scores.append(compute_alignment_cc(ref_stack[0], ref_stack[i], matrices[i]))
+
+    if auto_refine:
+        auto_refine_matrices(ref_stack, matrices, scores, log=log)
 
     progress(1.0, f"[{visit_name}] Alignment ready.")
 
@@ -150,9 +214,10 @@ def prepare_visit(
     low = plan.low_confidence_indices()
     if low:
         human = ", ".join(str(i + 1) for i in low)
+        suffix = " (after auto-refine)" if auto_refine else ""
         log(
-            f"  [REVIEW] {len(low)} capture(s) below confidence "
-            f"{DEFAULT_CONFIDENCE_THRESHOLD}: capture {human}. "
+            f"  [REVIEW] {len(low)} capture(s) still below confidence "
+            f"{DEFAULT_CONFIDENCE_THRESHOLD}{suffix}: capture {human}. "
             "Manual corresponding-point correction is recommended."
         )
     return plan
@@ -266,6 +331,7 @@ def run_registration_pipeline(
     apply_clahe_to_ref: bool = False,
     automate_tuning: bool = True,
     overrides_by_visit: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
+    auto_refine: bool = True,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None
 ):
@@ -320,7 +386,7 @@ def run_registration_pipeline(
             progress(base_prog + (0.6 + val * 0.4) * v_scale, status)
 
         try:
-            plan = prepare_visit(visit_dir, progress_callback=prep_progress, log_callback=log)
+            plan = prepare_visit(visit_dir, progress_callback=prep_progress, log_callback=log, auto_refine=auto_refine)
         except ValueError as e:
             log(f"ERROR in {visit_name}: {e}")
             return False
