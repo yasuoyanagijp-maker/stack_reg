@@ -57,6 +57,7 @@ def create_manual_align_view(
     on_back,
     on_finalize,
     focus_layer: int | None = None,
+    preloaded_stacks: dict | None = None,
 ):
     """
     Interactive corresponding-point correction screen.
@@ -70,11 +71,13 @@ def create_manual_align_view(
                        editor shows that layer's capture images instead of the
                        Image 5 reference stack, matching the result the user
                        selected for review.
+    ``preloaded_stacks`` : optional ``{visit_name: stack}`` to avoid loading
+                       4×-enlarged layers on the UI thread after navigation.
     """
     plans_by_name = {p.visit_name: p for p in plans}
 
     # Cache per-visit display stacks (Image 5 or the focused layer).
-    display_stacks = {}
+    display_stacks = dict(preloaded_stacks or {})
 
     def display_stack_for(plan):
         key = plan.visit_name
@@ -156,7 +159,7 @@ def create_manual_align_view(
         )
         page.update()
 
-    def refresh_capture_list():
+    def refresh_capture_list(*, do_update: bool = True):
         plan = plans_by_name[state["visit"]]
         capture_list.controls.clear()
         for idx in range(1, len(plan.matrices)):  # skip anchor (capture 0)
@@ -184,7 +187,11 @@ def create_manual_align_view(
                     on_click=lambda _, i=idx: select_capture(i),
                 )
             )
-        page.update()
+        if do_update:
+            try:
+                page.update()
+            except Exception:
+                pass
 
     def select_capture(idx):
         state["capture"] = idx
@@ -399,6 +406,6 @@ def create_manual_align_view(
         ft.Row([left_panel, ft.VerticalDivider(width=1), editor_panel], expand=True),
     ], expand=True, spacing=8)
 
-    # Initialize selection
-    refresh_capture_list()
+    # Initialize selection without page.update — view is not mounted yet.
+    refresh_capture_list(do_update=False)
     return view

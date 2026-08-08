@@ -1,4 +1,5 @@
 import flet as ft
+import asyncio
 import contextlib
 import os
 import time
@@ -244,15 +245,45 @@ def create_dashboard(page: ft.Page, mount_view=None):
 
         page.run_thread(run_pipeline)
 
+    def _loading_view(message: str):
+        return ft.Column(
+            [
+                ft.Container(expand=True),
+                ft.Row(
+                    [
+                        ft.ProgressRing(width=36, height=36, stroke_width=3),
+                        ft.Text(message, size=16, color=ft.Colors.CYAN_200),
+                    ],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    spacing=16,
+                ),
+                ft.Container(expand=True),
+            ],
+            expand=True,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
     async def open_manual_view(plans, focus_layer):
+        """
+        Navigate to the manual editor.
+
+        Important: the dashboard (and its journal ListView) is unmounted while
+        the results screen is showing. Do **not** call log_messages.update()
+        here — that used to abort navigation silently on Flet 0.84.
+        """
         review_state["plans"] = plans
         review_state["focus_layer"] = focus_layer
-        append_log_line(
-            f"Manual correction for image{focus_layer + 1} "
-            f"({len(plans)} visit(s)). Select captures by eye.",
-            color=ft.Colors.CYAN_200,
-        )
-        log_messages.update()
+
+        if not mount_view:
+            page.snack_bar = ft.SnackBar(
+                ft.Text("View host is not available; restart the app.")
+            )
+            page.snack_bar.open = True
+            page.update()
+            return
+
+        image_label = f"image{focus_layer + 1}" if focus_layer is not None else "reference"
+        mount_view(_loading_view(f"Opening manual registration ({image_label})…"))
 
         def back_to_results():
             out = review_state.get("patient_output_dir")
@@ -266,15 +297,40 @@ def create_dashboard(page: ft.Page, mount_view=None):
             else:
                 go_dashboard()
 
-        view = create_manual_align_view(
-            page,
-            plans,
-            on_back=back_to_results,
-            on_finalize=handle_finalize,
-            focus_layer=focus_layer,
-        )
-        if mount_view:
+        def preload():
+            stacks = {}
+            for plan in plans:
+                if focus_layer is not None:
+                    stacks[plan.visit_name] = plan.load_layer_stack(focus_layer)
+                else:
+                    stacks[plan.visit_name] = plan.ref_stack
+            return stacks
+
+        try:
+            preloaded = await asyncio.to_thread(preload)
+            view = create_manual_align_view(
+                page,
+                plans,
+                on_back=back_to_results,
+                on_finalize=handle_finalize,
+                focus_layer=focus_layer,
+                preloaded_stacks=preloaded,
+            )
             mount_view(view)
+        except Exception as exc:
+            page.snack_bar = ft.SnackBar(
+                ft.Text(f"Failed to open manual registration: {exc}")
+            )
+            page.snack_bar.open = True
+            out = review_state.get("patient_output_dir")
+            if out:
+                await show_results(
+                    out,
+                    review_state.get("last_corrections"),
+                    focus_layer + 1 if focus_layer is not None else None,
+                )
+            else:
+                go_dashboard()
 
     def start_manual_for_image(image_num: int, visit_name):
         """
@@ -286,10 +342,16 @@ def create_dashboard(page: ft.Page, mount_view=None):
         plans = list(review_state.get("plans") or [])
         if not plans:
             page.snack_bar = ft.SnackBar(
-                ft.Text("Run Registration first, then Review & Correct from the results screen.")
+                ft.Text(
+                    "Session plans are missing. Run Registration again in this "
+                    "session, then press Review & Correct."
+                )
             )
             page.snack_bar.open = True
-            page.update()
+            try:
+                page.update()
+            except Exception:
+                pass
             return
 
         focus_layer = image_num - 1  # image1 → layer 0
@@ -303,7 +365,10 @@ def create_dashboard(page: ft.Page, mount_view=None):
                     )
                 )
                 page.snack_bar.open = True
-                page.update()
+                try:
+                    page.update()
+                except Exception:
+                    pass
                 return
 
         # Prefer the visit matching the reviewed result file.
@@ -314,11 +379,7 @@ def create_dashboard(page: ft.Page, mount_view=None):
 
         review_state["focus_layer"] = focus_layer
         review_state["focus_visit"] = visit_name
-        schedule_log(
-            f"--- Manual registration for image{image_num}"
-            + (f" ({visit_name})" if visit_name else "")
-            + " (no re-alignment) ---"
-        )
+        # Do not schedule_log here: journal is unmounted on the results screen.
         page.run_task(open_manual_view, plans, focus_layer)
 
     def handle_finalize(overrides_by_visit, points_by_visit):

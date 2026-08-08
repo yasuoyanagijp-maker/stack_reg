@@ -26,8 +26,16 @@ async def main(page: ft.Page):
     root = ft.Container(expand=True)
 
     def mount_view(control):
+        """Swap the visible root content. Safe to call from the page event loop."""
         root.content = control
-        page.update()
+        try:
+            root.update()
+        except Exception:
+            # Fallback when the control tree is mid-rebuild.
+            try:
+                page.update()
+            except Exception:
+                pass
 
     dashboard = create_dashboard(page, mount_view=mount_view)
     root.content = dashboard
