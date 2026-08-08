@@ -11,6 +11,7 @@ from app.core.pipeline import (
 from app.core.registration import DEFAULT_CONFIDENCE_THRESHOLD
 from app.core.manual_align import save_session
 from app.ui.manual_align_view import create_manual_align_view
+from app.ui.results_view import create_results_view
 
 def create_dashboard(page: ft.Page, mount_view=None):
     """
@@ -247,6 +248,16 @@ def create_dashboard(page: ft.Page, mount_view=None):
 
         page.run_thread(work)
 
+    async def show_results(patient_output_dir, corrections_summary):
+        view = create_results_view(
+            page,
+            patient_output_dir,
+            on_back=go_dashboard,
+            corrections_summary=corrections_summary,
+        )
+        if mount_view:
+            mount_view(view)
+
     def handle_finalize(overrides_by_visit, points_by_visit):
         plans = review_state["plans"]
         if not plans:
@@ -307,6 +318,11 @@ def create_dashboard(page: ft.Page, mount_view=None):
             except Exception as exc:
                 schedule_log(f"ERROR: {exc}", color=ft.Colors.RED_400)
             page.run_task(ui_complete, success)
+            if success:
+                corrections = {
+                    v: sorted(d.keys()) for v, d in (overrides_by_visit or {}).items() if d
+                }
+                page.run_task(show_results, patient_output_dir, corrections)
 
         page.run_thread(work)
 
