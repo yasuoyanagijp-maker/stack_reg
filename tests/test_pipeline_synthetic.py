@@ -61,6 +61,9 @@ def test_prepare_visit_shapes(tmp_path):
     assert np.allclose(plan.matrices[0], np.eye(2, 3))
     # low_confidence_indices excludes the anchor
     assert 0 not in plan.low_confidence_indices()
+    layer0 = plan.load_layer_stack(0)
+    assert layer0.shape[0] == 3
+    assert layer0.shape[1:] == plan.ref_stack.shape[1:]
 
 
 def test_finalize_writes_outputs(tmp_path):
@@ -91,12 +94,23 @@ def test_matrix_override_changes_output(tmp_path):
     bad[0, 2] += 200.0
     out_over = tmp_path / "over"
     out_over.mkdir()
-    finalize_visit(plan, "P", str(out_over), matrix_overrides={1: bad})
+    # source_layer=0 means params came from image1; they must still rewrite all layers.
+    finalize_visit(
+        plan, "P", str(out_over), matrix_overrides={1: bad}, source_layer=0
+    )
 
-    a = cv2.imread(os.path.join(out_auto, os.listdir(out_auto)[0]), cv2.IMREAD_GRAYSCALE)
-    b = cv2.imread(os.path.join(out_over, os.listdir(out_over)[0]), cv2.IMREAD_GRAYSCALE)
-    assert a.shape == b.shape
-    assert not np.array_equal(a, b), "override should alter the averaged output"
+    auto_files = sorted(f for f in os.listdir(out_auto) if f.endswith(".tif"))
+    over_files = sorted(f for f in os.listdir(out_over) if f.endswith(".tif"))
+    assert auto_files == over_files
+    assert any(f.endswith("image1.tif") for f in over_files)
+    assert any(f.endswith("image2.tif") for f in over_files)
+
+    for fname in auto_files:
+        a = cv2.imread(os.path.join(out_auto, fname), cv2.IMREAD_GRAYSCALE)
+        b = cv2.imread(os.path.join(out_over, fname), cv2.IMREAD_GRAYSCALE)
+        assert a is not None and b is not None
+        assert a.shape == b.shape
+        assert not np.array_equal(a, b), f"override should alter {fname}"
 
     # The plan's original matrices must be untouched by the override.
     assert plan.matrices[1][0, 2] != bad[0, 2]

@@ -78,6 +78,29 @@ class VisitPlan:
             if i > 0 and s < threshold
         ]
 
+    def load_layer_stack(self, layer_idx: int) -> np.ndarray:
+        """
+        Load the 4×-enlarged grayscale images for ``layer_idx`` (0-based) across
+        every capture. Same spatial size as ``ref_stack`` (Image 5), so affine
+        matrices remain interchangeable for display and warping.
+        """
+        if not self.sorted_captures:
+            raise ValueError("VisitPlan has no captures.")
+        n_layers = len(self.folder_contents[self.sorted_captures[0]])
+        if layer_idx < 0 or layer_idx >= n_layers:
+            raise ValueError(
+                f"layer_idx {layer_idx} out of range for {n_layers} layer(s)."
+            )
+        slices: List[np.ndarray] = []
+        for capture_folder in self.sorted_captures:
+            filename = self.folder_contents[capture_folder][layer_idx]
+            file_path = os.path.join(self.visit_dir, capture_folder, filename)
+            img = imread_grayscale(file_path)
+            if img is None:
+                raise ValueError(f"Failed to read: {file_path}")
+            slices.append(enlarge_image_4x(img))
+        return np.stack(slices, axis=0)
+
 
 def _noop_progress(val: float, status: str):
     pass
@@ -145,9 +168,9 @@ def prepare_visit(
     When ``auto_refine`` is True, any capture whose intensity-based alignment is
     below the confidence threshold gets an automatic second attempt via a
     feature-based (ORB + RANSAC) estimate; the better of the two (measured with
-    the same correlation metric) is kept. This is the automatic step tried
-    *before* asking the user for manual corresponding points — only captures that
-    remain below the threshold afterwards are flagged for manual correction.
+    the same correlation metric) is kept. Manual corresponding-point correction
+    is started later by the user from the post-run review screen (visual
+    selection of a result image) — not by automatic flagging here.
 
     ``progress_callback`` receives values in ``0.0..1.0`` scoped to this phase.
     Raises ``ValueError`` on validation / IO failures.
@@ -210,16 +233,6 @@ def prepare_visit(
         matrices=matrices,
         scores=scores,
     )
-
-    low = plan.low_confidence_indices()
-    if low:
-        human = ", ".join(str(i + 1) for i in low)
-        suffix = " (after auto-refine)" if auto_refine else ""
-        log(
-            f"  [REVIEW] {len(low)} capture(s) still below confidence "
-            f"{DEFAULT_CONFIDENCE_THRESHOLD}{suffix}: capture {human}. "
-            "Manual corresponding-point correction is recommended."
-        )
     return plan
 
 
@@ -230,16 +243,23 @@ def finalize_visit(
     apply_clahe_to_ref: bool = False,
     automate_tuning: bool = True,
     matrix_overrides: Optional[Dict[int, np.ndarray]] = None,
+    source_layer: Optional[int] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """
     Phase 2 for a single Visit: apply the (optionally manually corrected) capture
-    matrices to every layer, enhance with CLAHE, average-project and save.
+    matrices to every layer (still via the 4× enlarge path), enhance with CLAHE,
+    average-project and save.
 
     ``matrix_overrides`` maps a capture index to a replacement 2x3 matrix (as
     produced by ``estimate_affine_from_correspondences``); these take precedence
     over the automatic alignment for the affected captures.
+
+    The same per-capture matrices are applied to **all** layers (image1…imageN).
+    When the user corrected landmarks on one selected result image, pass that
+    0-based index as ``source_layer`` so the journal records which image the
+    parameters came from; the transforms still rewrite every output image.
 
     ``progress_callback`` receives values in ``0.0..1.0`` scoped to this phase.
     """
@@ -260,6 +280,18 @@ def finalize_visit(
 
     total_captures = len(sorted_captures)
     total_layers = len(folder_contents[sorted_captures[0]])
+
+    if matrix_overrides:
+        src = (
+            f"image{source_layer + 1}"
+            if source_layer is not None
+            else "manual corresponding points"
+        )
+        all_imgs = ", ".join(f"image{i + 1}" for i in range(total_layers))
+        log(
+            f"  [MANUAL] Parameters from {src} will be applied to all layers "
+            f"({all_imgs})."
+        )
 
     for layer_idx in range(total_layers):
         layer_weight = 1.0 / total_layers
@@ -289,6 +321,7 @@ def finalize_visit(
         def layer_warp_cb(inner_val, inner_status):
             progress(layer_base + (inner_val * 0.5 * layer_weight), f"[{visit_name}] L{layer_idx+1}: {inner_status}")
 
+        # Same matrices for every layer — manual params from one image apply to all.
         registered_stack = apply_transformations_to_stack(stack_array, matrices, progress_callback=layer_warp_cb)
         log(f"    Warp complete.")
 
@@ -334,7 +367,7 @@ def run_registration_pipeline(
     auto_refine: bool = True,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None
-):
+) -> Optional[List[VisitPlan]]:
     """
     Orchestrates the entire OCTA Registration process with strict parity 
     to the ImageJ macro logic, supporting both single Visit and full Patient structures.
@@ -342,6 +375,10 @@ def run_registration_pipeline(
     ``overrides_by_visit`` optionally maps a visit name to ``{capture_index: matrix}``
     manual corresponding-point corrections, which override the automatic alignment
     for those captures.
+
+    Returns the list of prepared ``VisitPlan`` objects on success (kept for a
+    subsequent visual Review & Correct without re-running alignment), or
+    ``None`` on failure.
     """
     
     def log(msg: str):
@@ -360,7 +397,7 @@ def run_registration_pipeline(
     visits = discover_visits(input_dir)
     if not visits:
         log("ERROR: No valid Visit folders found. Expected a folder containing visits, or a visit containing layers.")
-        return False
+        return None
 
     patient_name = os.path.basename(input_dir.rstrip(os.sep))
     patient_output_dir = os.path.join(output_dir, patient_name)
@@ -370,6 +407,7 @@ def run_registration_pipeline(
 
     total_visits = len(visits)
     overrides_by_visit = overrides_by_visit or {}
+    plans: List[VisitPlan] = []
 
     for v_idx, visit_dir in enumerate(visits):
         visit_name = os.path.basename(visit_dir.rstrip(os.sep))
@@ -389,10 +427,10 @@ def run_registration_pipeline(
             plan = prepare_visit(visit_dir, progress_callback=prep_progress, log_callback=log, auto_refine=auto_refine)
         except ValueError as e:
             log(f"ERROR in {visit_name}: {e}")
-            return False
+            return None
         except Exception as e:
             log(f"ERROR creating reference stack for {visit_name}: {str(e)}")
-            return False
+            return None
 
         ok = finalize_visit(
             plan,
@@ -405,8 +443,9 @@ def run_registration_pipeline(
             log_callback=log,
         )
         if not ok:
-            return False
+            return None
+        plans.append(plan)
 
     progress(1.0, "Completed successfully.")
     log("\n--- Pipeline Finished ---")
-    return True
+    return plans
