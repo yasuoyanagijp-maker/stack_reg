@@ -15,11 +15,12 @@ import cv2
 import numpy as np
 
 
-def to_base64_png(img: np.ndarray, max_side: Optional[int] = None) -> str:
+def to_png_bytes(img: np.ndarray, max_side: Optional[int] = None) -> bytes:
     """
-    Encode a grayscale or BGR image as a base64 PNG string suitable for
-    ``ft.Image(src_base64=...)``. Optionally downscale so the longest side is at
-    most ``max_side`` px (keeps the UI responsive for 4x-enlarged captures).
+    Encode a grayscale or BGR image as raw PNG bytes suitable for
+    ``ft.Image(src=...)`` (Flet accepts raw bytes directly). Optionally downscale
+    so the longest side is at most ``max_side`` px (keeps the UI responsive for
+    4x-enlarged captures).
     """
     out = img
     if max_side is not None:
@@ -31,7 +32,16 @@ def to_base64_png(img: np.ndarray, max_side: Optional[int] = None) -> str:
     ok, buf = cv2.imencode(".png", out)
     if not ok:
         raise ValueError("Failed to PNG-encode image for display.")
-    return base64.b64encode(buf.tobytes()).decode("ascii")
+    return buf.tobytes()
+
+
+def to_base64_png(img: np.ndarray, max_side: Optional[int] = None) -> str:
+    """
+    Encode a grayscale or BGR image as a base64 PNG string. Prefer
+    ``to_png_bytes`` for Flet display; this remains for callers that need a
+    base64 string.
+    """
+    return base64.b64encode(to_png_bytes(img, max_side=max_side)).decode("ascii")
 
 
 def make_overlay(reference: np.ndarray, source: np.ndarray, matrix: np.ndarray) -> np.ndarray:

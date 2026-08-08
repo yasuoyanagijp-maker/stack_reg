@@ -6,9 +6,39 @@ from app.core.registration import (
     compute_alignment_cc,
     DEFAULT_CONFIDENCE_THRESHOLD,
 )
-from app.core.manual_align import to_base64_png, make_overlay, draw_landmarks
+from app.core.manual_align import to_png_bytes, make_overlay, draw_landmarks
 
 DISPLAY_W = 360
+
+def _placeholder_png(text: str = "No capture selected") -> bytes:
+    """
+    A neutral DISPLAY_W x DISPLAY_W panel shown in the image slots before a
+    capture is selected. Keeping the images always visible (rather than
+    ``visible=False``) preserves the editor layout: collapsing them makes the
+    whole panel (captions, buttons, status) fail to render in Flet 0.84.
+    An empty ``src`` is also not an option - it renders an error box.
+    """
+    import cv2
+    canvas = np.full((DISPLAY_W, DISPLAY_W), 24, dtype=np.uint8)
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)
+    cv2.putText(canvas, text, ((DISPLAY_W - tw) // 2, (DISPLAY_W + th) // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, 110, 1, cv2.LINE_AA)
+    return to_png_bytes(canvas)
+
+
+_PLACEHOLDER_PNG = _placeholder_png()
+_PREVIEW_PLACEHOLDER_PNG = _placeholder_png("No preview computed")
+
+
+def _short_name(name: str, limit: int = 24) -> str:
+    """Truncate long capture folder names for compact UI labels."""
+    return name if len(name) <= limit else name[:limit - 1] + "…"
+
+
+def _capture_folder(plan, idx: int) -> str:
+    """Folder name of capture ``idx`` in ``plan`` ('' if unknown)."""
+    caps = getattr(plan, "sorted_captures", None) or []
+    return caps[idx] if 0 <= idx < len(caps) else ""
 
 
 def _resize_for_display(img: np.ndarray, width: int = DISPLAY_W):
@@ -52,17 +82,19 @@ def create_manual_align_view(
     capture_list = ft.ListView(expand=True, spacing=4, padding=4)
 
     ref_img = ft.Image(width=DISPLAY_W, height=DISPLAY_W, fit=ft.BoxFit.FILL,
-                       border_radius=6, src="")
+                       border_radius=6, src=_PLACEHOLDER_PNG)
     src_img = ft.Image(width=DISPLAY_W, height=DISPLAY_W, fit=ft.BoxFit.FILL,
-                       border_radius=6, src="")
+                       border_radius=6, src=_PLACEHOLDER_PNG)
     preview_img = ft.Image(width=DISPLAY_W, height=DISPLAY_W, fit=ft.BoxFit.FILL,
-                           border_radius=6, src="", visible=False)
+                           border_radius=6, src=_PREVIEW_PLACEHOLDER_PNG)
 
     status_text = ft.Text("Select a capture on the left to begin.",
                           size=13, color=ft.Colors.CYAN_200)
     cc_text = ft.Text("", size=13, color=ft.Colors.GREY_300)
 
-    ref_caption = ft.Text("Reference (Capture 1)", size=13, weight=ft.FontWeight.BOLD)
+    ref_caption = ft.Text(
+        f"Reference (Capture 1 — {_short_name(_capture_folder(plans[0], 0))})",
+        size=13, weight=ft.FontWeight.BOLD)
     src_caption = ft.Text("Source", size=13, weight=ft.FontWeight.BOLD)
 
     def cur_points():
@@ -92,10 +124,14 @@ def create_manual_align_view(
         pts = cur_points()
         ref_marked = draw_landmarks(ref_disp, to_display_pts(pts["ref"]), color=(0, 255, 0))
         src_marked = draw_landmarks(src_disp, to_display_pts(pts["src"]), color=(255, 0, 255))
-        ref_img.src = to_base64_png(ref_marked)
-        src_img.src = to_base64_png(src_marked)
-        ref_caption.value = "Reference (Capture 1) — green"
-        src_caption.value = f"Source (Capture {cap+1}) — magenta"
+        ref_img.src = to_png_bytes(ref_marked)
+        src_img.src = to_png_bytes(src_marked)
+        ref_caption.value = (
+            f"Reference (Capture 1 — {_short_name(_capture_folder(plan, 0))}) — green"
+        )
+        src_caption.value = (
+            f"Source (Capture {cap+1} — {_short_name(_capture_folder(plan, cap))}) — magenta"
+        )
         page.update()
 
     def refresh_capture_list():
@@ -120,7 +156,8 @@ def create_manual_align_view(
                             (ft.Icons.WARNING_AMBER if low else ft.Icons.CIRCLE_OUTLINED),
                             color=col, size=16,
                         ),
-                        ft.Text(f"Capture {idx+1}", size=13,
+                        ft.Text(f"Capture {idx+1} — {_short_name(_capture_folder(plan, idx))}",
+                                size=13,
                                 weight=ft.FontWeight.BOLD if selected else ft.FontWeight.NORMAL),
                         ft.Container(expand=True),
                         ft.Text(badge, size=11, color=col),
@@ -135,7 +172,7 @@ def create_manual_align_view(
 
     def select_capture(idx):
         state["capture"] = idx
-        preview_img.visible = False
+        preview_img.src = _PREVIEW_PLACEHOLDER_PNG
         cc_text.value = ""
         n_ref = len(cur_points()["ref"])
         n_src = len(cur_points()["src"])
@@ -150,9 +187,15 @@ def create_manual_align_view(
         state["visit"] = name
         state["capture"] = None
         refresh_capture_list()
-        ref_img.src = ""
-        src_img.src = ""
-        preview_img.visible = False
+        ref_img.src = _PLACEHOLDER_PNG
+        src_img.src = _PLACEHOLDER_PNG
+        preview_img.src = _PREVIEW_PLACEHOLDER_PNG
+        ref_img.height = DISPLAY_W
+        src_img.height = DISPLAY_W
+        preview_img.height = DISPLAY_W
+        plan = plans_by_name[name]
+        ref_caption.value = f"Reference (Capture 1 — {_short_name(_capture_folder(plan, 0))})"
+        src_caption.value = "Source"
         status_text.value = "Select a capture on the left to begin."
         page.update()
 
@@ -187,7 +230,7 @@ def create_manual_align_view(
             return
         key = (state["visit"], state["capture"])
         points[key] = {"ref": [], "src": []}
-        preview_img.visible = False
+        preview_img.src = _PREVIEW_PLACEHOLDER_PNG
         cc_text.value = ""
         status_text.value = "Points cleared."
         render_images()
@@ -218,8 +261,7 @@ def create_manual_align_view(
         auto_cc = compute_alignment_cc(ref_full, src_full, plan.matrices[cap])
         manual_cc = compute_alignment_cc(ref_full, src_full, matrix)
 
-        preview_img.src = to_base64_png(overlay, max_side=DISPLAY_W)
-        preview_img.visible = True
+        preview_img.src = to_png_bytes(overlay, max_side=DISPLAY_W)
         cc_text.value = (
             f"Alignment score — auto: {auto_cc:.3f}   manual: {manual_cc:.3f}   "
             + ("(better ✓)" if manual_cc >= auto_cc else "(worse — check points)")
@@ -245,7 +287,7 @@ def create_manual_align_view(
             return
         overrides[state["visit"]].pop(state["capture"], None)
         state.pop("_pending_matrix", None)
-        preview_img.visible = False
+        preview_img.src = _PREVIEW_PLACEHOLDER_PNG
         cc_text.value = ""
         status_text.value = f"Capture {state['capture']+1} reverted to automatic alignment."
         refresh_capture_list()
