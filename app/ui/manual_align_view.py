@@ -4,11 +4,11 @@ import numpy as np
 from app.core.registration import (
     estimate_affine_from_correspondences,
     compute_alignment_cc,
-    DEFAULT_CONFIDENCE_THRESHOLD,
 )
 from app.core.manual_align import to_png_bytes, make_overlay, draw_landmarks
 
 DISPLAY_W = 360
+
 
 def _placeholder_png(text: str = "No capture selected") -> bytes:
     """
@@ -56,18 +56,34 @@ def create_manual_align_view(
     plans,
     on_back,
     on_finalize,
-    threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    focus_layer: int | None = None,
 ):
     """
     Interactive corresponding-point correction screen.
 
-    ``plans``       : list of ``VisitPlan`` (already prepared / auto-aligned).
-    ``on_back``     : callback to return to the dashboard.
-    ``on_finalize`` : callback(overrides_by_visit, points_by_visit) invoked when
-                      the user commits the corrections; the dashboard runs the
-                      warping/averaging in a worker thread.
+    ``plans``        : list of ``VisitPlan`` (already prepared / auto-aligned).
+    ``on_back``      : callback to return to the previous screen.
+    ``on_finalize``  : callback(overrides_by_visit, points_by_visit) invoked when
+                       the user commits the corrections; the dashboard runs the
+                       warping/averaging in a worker thread.
+    ``focus_layer``  : optional 0-based layer index (image1 → 0). When set, the
+                       editor shows that layer's capture images instead of the
+                       Image 5 reference stack, matching the result the user
+                       selected for review.
     """
     plans_by_name = {p.visit_name: p for p in plans}
+
+    # Cache per-visit display stacks (Image 5 or the focused layer).
+    display_stacks = {}
+
+    def display_stack_for(plan):
+        key = plan.visit_name
+        if key not in display_stacks:
+            if focus_layer is not None:
+                display_stacks[key] = plan.load_layer_stack(focus_layer)
+            else:
+                display_stacks[key] = plan.ref_stack
+        return display_stacks[key]
 
     # --- Correction state -------------------------------------------------
     # overrides[visit][capture_idx] = 2x3 float32 matrix
@@ -88,8 +104,13 @@ def create_manual_align_view(
     preview_img = ft.Image(width=DISPLAY_W, height=DISPLAY_W, fit=ft.BoxFit.FILL,
                            border_radius=6, src=_PREVIEW_PLACEHOLDER_PNG)
 
-    status_text = ft.Text("Select a capture on the left to begin.",
-                          size=13, color=ft.Colors.CYAN_200)
+    layer_hint = (
+        f" (image{focus_layer + 1})" if focus_layer is not None else ""
+    )
+    status_text = ft.Text(
+        f"Select a capture on the left to begin{layer_hint}.",
+        size=13, color=ft.Colors.CYAN_200,
+    )
     cc_text = ft.Text("", size=13, color=ft.Colors.GREY_300)
 
     ref_caption = ft.Text(
@@ -112,8 +133,9 @@ def create_manual_align_view(
         cap = state["capture"]
         if cap is None:
             return
-        ref_full = plan.ref_stack[0]
-        src_full = plan.ref_stack[cap]
+        stack = display_stack_for(plan)
+        ref_full = stack[0]
+        src_full = stack[cap]
         ref_disp, disp_h, scale = _resize_for_display(ref_full)
         src_disp, _, _ = _resize_for_display(src_full)
         state["disp_scale"] = scale
@@ -138,24 +160,18 @@ def create_manual_align_view(
         plan = plans_by_name[state["visit"]]
         capture_list.controls.clear()
         for idx in range(1, len(plan.matrices)):  # skip anchor (capture 0)
-            score = plan.scores[idx] if idx < len(plan.scores) else 0.0
-            low = score < threshold
             corrected = idx in overrides[plan.visit_name]
             if corrected:
                 badge, col = "corrected", ft.Colors.GREEN_400
-            elif low:
-                badge, col = f"{score:.2f} low", ft.Colors.RED_400
+                icon = ft.Icons.CHECK_CIRCLE
             else:
-                badge, col = f"{score:.2f}", ft.Colors.GREY_400
+                badge, col = "review", ft.Colors.GREY_400
+                icon = ft.Icons.CIRCLE_OUTLINED
             selected = idx == state["capture"]
             capture_list.controls.append(
                 ft.Container(
                     content=ft.Row([
-                        ft.Icon(
-                            ft.Icons.CHECK_CIRCLE if corrected else
-                            (ft.Icons.WARNING_AMBER if low else ft.Icons.CIRCLE_OUTLINED),
-                            color=col, size=16,
-                        ),
+                        ft.Icon(icon, color=col, size=16),
                         ft.Text(f"Capture {idx+1} — {_short_name(_capture_folder(plan, idx))}",
                                 size=13,
                                 weight=ft.FontWeight.BOLD if selected else ft.FontWeight.NORMAL),
@@ -196,7 +212,7 @@ def create_manual_align_view(
         plan = plans_by_name[name]
         ref_caption.value = f"Reference (Capture 1 — {_short_name(_capture_folder(plan, 0))})"
         src_caption.value = "Source"
-        status_text.value = "Select a capture on the left to begin."
+        status_text.value = f"Select a capture on the left to begin{layer_hint}."
         page.update()
 
     def add_point(which, e):
@@ -255,8 +271,9 @@ def create_manual_align_view(
             page.update()
             return
 
-        ref_full = plan.ref_stack[0]
-        src_full = plan.ref_stack[cap]
+        stack = display_stack_for(plan)
+        ref_full = stack[0]
+        src_full = stack[cap]
         overlay = make_overlay(ref_full, src_full, matrix)
         auto_cc = compute_alignment_cc(ref_full, src_full, plan.matrices[cap])
         manual_cc = compute_alignment_cc(ref_full, src_full, matrix)
@@ -330,13 +347,20 @@ def create_manual_align_view(
         ft.OutlinedButton("Revert to auto", icon=ft.Icons.RESTORE, on_click=revert_auto),
     ], wrap=True, spacing=8)
 
+    title_suffix = f" — image{focus_layer + 1}" if focus_layer is not None else ""
+
     left_panel = ft.Container(
         content=ft.Column([
             ft.Text("Visits", size=14, weight=ft.FontWeight.BOLD),
             visit_row,
             ft.Divider(height=10),
             ft.Text("Captures (aligned to Capture 1)", size=14, weight=ft.FontWeight.BOLD),
-            ft.Text(f"Red = below confidence {threshold:.2f}", size=11, color=ft.Colors.RED_300),
+            ft.Text(
+                "Select any capture to correct by eye — no automatic flagging.\n"
+                "On Finalize & Save, the same registration parameters are applied "
+                "to all result images (image1–imageN), not only the one you edited.",
+                size=11, color=ft.Colors.GREY_400,
+            ),
             capture_list,
         ], spacing=8, expand=True),
         width=260,
@@ -359,9 +383,9 @@ def create_manual_align_view(
     ], spacing=12, expand=True, scroll=ft.ScrollMode.AUTO)
 
     header = ft.Row([
-        ft.IconButton(icon=ft.Icons.ARROW_BACK, tooltip="Back to dashboard",
+        ft.IconButton(icon=ft.Icons.ARROW_BACK, tooltip="Back",
                       on_click=lambda e: on_back()),
-        ft.Text("Manual Corresponding-Point Correction", size=22,
+        ft.Text(f"Manual Corresponding-Point Correction{title_suffix}", size=22,
                 weight=ft.FontWeight.BOLD, color=ft.Colors.CYAN_400),
         ft.Container(expand=True),
         ft.FilledButton("Finalize & Save", icon=ft.Icons.SAVE,

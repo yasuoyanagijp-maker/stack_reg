@@ -4,12 +4,8 @@ import os
 import time
 from app.core.pipeline import (
     run_registration_pipeline,
-    discover_visits,
-    prepare_visit,
     finalize_visit,
 )
-from app.core.registration import DEFAULT_CONFIDENCE_THRESHOLD
-from app.core.manual_align import save_session
 from app.ui.manual_align_view import create_manual_align_view
 from app.ui.results_view import create_results_view
 
@@ -18,23 +14,31 @@ def create_dashboard(page: ft.Page, mount_view=None):
     Creates the main dashboard UI for the ARIAKE OCTA Registration Tool.
 
     ``mount_view`` (optional) swaps the app's root content to another control,
-    enabling the manual corresponding-point correction screen. When provided, a
-    "Review & Correct" action is exposed alongside the automatic run.
+    enabling the post-run review screen and manual corresponding-point editor.
 
     Flet v0.84.0 API Notes:
     - FilePicker.get_directory_path() is now synchronous and returns str|None directly.
     - No on_result / on_select callbacks exist anymore.
-    - The picker must be added to page.overlay before use.
+    - The picker must be added to page.services before use.
     """
     layout_ref = {}  # holds the dashboard layout so we can navigate back to it
-    
+
     # --- State Variables ---
     input_path = ft.Text("No directory selected", color=ft.Colors.GREY_400)
     output_path = ft.Text("No directory selected", color=ft.Colors.GREY_400)
     progress_bar = ft.ProgressBar(width=None, value=0, color=ft.Colors.CYAN_400, bgcolor=ft.Colors.GREY_800)
     progress_text = ft.Text("Ready", size=14, color=ft.Colors.CYAN_200)
     log_messages = ft.ListView(expand=True, spacing=5, padding=10, auto_scroll=True)
-    
+
+    # Session state shared across run → review → manual → finalize
+    review_state = {
+        "plans": [],
+        "patient_output_dir": None,
+        "focus_layer": None,
+        "focus_visit": None,
+        "last_corrections": None,
+    }
+
     # --- File Pickers (v0.84: Service, not visual control) ---
     input_picker = ft.FilePicker()
     output_picker = ft.FilePicker()
@@ -52,6 +56,10 @@ def create_dashboard(page: ft.Page, mount_view=None):
     async def ui_log(message: str, color=ft.Colors.WHITE):
         append_log_line(message, color)
         log_messages.update()
+        try:
+            await log_messages.scroll_to(offset=-1, duration=0)
+        except Exception:
+            pass
 
     async def ui_progress(val: float, status: str):
         progress_bar.value = val
@@ -59,7 +67,7 @@ def create_dashboard(page: ft.Page, mount_view=None):
         progress_bar.update()
         progress_text.update()
 
-    async def ui_complete(success: bool):
+    async def ui_complete(success: bool, show_review: bool = False):
         if success:
             append_log_line("--- All Tasks Completed! ---", color=ft.Colors.GREEN_400)
             page.snack_bar = ft.SnackBar(ft.Text("Registration successful!"))
@@ -67,8 +75,22 @@ def create_dashboard(page: ft.Page, mount_view=None):
         else:
             append_log_line("--- Error Occurred! ---", color=ft.Colors.RED_400)
         log_messages.update()
+        try:
+            await log_messages.scroll_to(offset=-1, duration=0)
+        except Exception:
+            pass
         progress_bar.update()
         progress_text.update()
+        if success and show_review and review_state.get("patient_output_dir"):
+            await show_results(
+                review_state["patient_output_dir"],
+                review_state.get("last_corrections"),
+                initial_image_num=(
+                    (review_state["focus_layer"] + 1)
+                    if review_state.get("focus_layer") is not None
+                    else None
+                ),
+            )
 
     _last_progress_ts = [0.0]
 
@@ -111,7 +133,7 @@ def create_dashboard(page: ft.Page, mount_view=None):
             add_log(f"Output directory set to: {result}")
 
     # --- UI Components ---
-    
+
     # Header Card
     header = ft.Container(
         content=ft.Column([
@@ -146,7 +168,7 @@ def create_dashboard(page: ft.Page, mount_view=None):
     # Settings Section
     clahe_layer1_switch = ft.Switch(label="Apply CLAHE to Layer 1 (Standard Reference)", value=False)
     auto_tuning_switch = ft.Switch(label="Automate Parameter Tuning", value=True)
-    
+
     settings_card = ft.Card(
         content=ft.Container(
             content=ft.Column([
@@ -159,104 +181,145 @@ def create_dashboard(page: ft.Page, mount_view=None):
         margin=ft.Margin.all(10),
     )
 
+    def go_dashboard():
+        if mount_view and layout_ref.get("layout") is not None:
+            mount_view(layout_ref["layout"])
+
+    async def show_results(patient_output_dir, corrections_summary=None, initial_image_num=None):
+        review_state["patient_output_dir"] = patient_output_dir
+        review_state["last_corrections"] = corrections_summary
+
+        def on_review_correct(image_num, visit_name):
+            start_manual_for_image(image_num, visit_name)
+
+        view = create_results_view(
+            page,
+            patient_output_dir,
+            on_back=go_dashboard,
+            on_review_correct=on_review_correct if mount_view else None,
+            corrections_summary=corrections_summary,
+            initial_image_num=initial_image_num,
+        )
+        if mount_view:
+            mount_view(view)
+
     def start_processing(e):
         if input_path.value == "No directory selected" or output_path.value == "No directory selected":
             page.snack_bar = ft.SnackBar(ft.Text("Please select both input and output directories!"))
             page.snack_bar.open = True
             page.update()
             return
-        
-        # Capture current switch states
+
         apply_clahe_val = clahe_layer1_switch.value
         auto_tuning_val = auto_tuning_switch.value
-        
+        input_dir = input_path.value
+        output_dir = output_path.value
+
         _last_progress_ts[0] = 0.0
         schedule_log("--- Starting registration ---")
+        review_state["focus_layer"] = None
+        review_state["last_corrections"] = None
+        review_state["plans"] = []
 
         def run_pipeline():
             success = False
             try:
                 with contextlib.redirect_stdout(JournalRedirector()):
-                    success = run_registration_pipeline(
-                        input_path.value,
-                        output_dir=output_path.value,
+                    plans = run_registration_pipeline(
+                        input_dir,
+                        output_dir=output_dir,
                         apply_clahe_to_ref=apply_clahe_val,
                         automate_tuning=auto_tuning_val,
                         progress_callback=schedule_progress,
                         log_callback=schedule_log,
                     )
+                if plans:
+                    success = True
+                    review_state["plans"] = plans
+                    patient_name = os.path.basename(input_dir.rstrip(os.sep))
+                    review_state["patient_output_dir"] = os.path.join(output_dir, patient_name)
             except Exception as exc:
                 schedule_log(f"ERROR: {exc}", color=ft.Colors.RED_400)
-            page.run_task(ui_complete, success)
+            page.run_task(ui_complete, success, True)
 
         page.run_thread(run_pipeline)
 
-    # --- Manual corresponding-point review workflow ---
-    review_state = {"plans": []}
-
-    def go_dashboard():
-        if mount_view and layout_ref.get("layout") is not None:
-            mount_view(layout_ref["layout"])
-
-    async def open_manual_view(plans):
+    async def open_manual_view(plans, focus_layer):
         review_state["plans"] = plans
-        total_low = sum(len(p.low_confidence_indices()) for p in plans)
+        review_state["focus_layer"] = focus_layer
         append_log_line(
-            f"Analysis complete: {len(plans)} visit(s). "
-            f"{total_low} capture(s) flagged for review.",
-            color=ft.Colors.AMBER_200 if total_low else ft.Colors.GREEN_400,
+            f"Manual correction for image{focus_layer + 1} "
+            f"({len(plans)} visit(s)). Select captures by eye.",
+            color=ft.Colors.CYAN_200,
         )
         log_messages.update()
+
+        def back_to_results():
+            out = review_state.get("patient_output_dir")
+            if out and mount_view:
+                page.run_task(
+                    show_results,
+                    out,
+                    review_state.get("last_corrections"),
+                    focus_layer + 1 if focus_layer is not None else None,
+                )
+            else:
+                go_dashboard()
+
         view = create_manual_align_view(
             page,
             plans,
-            on_back=go_dashboard,
+            on_back=back_to_results,
             on_finalize=handle_finalize,
-            threshold=DEFAULT_CONFIDENCE_THRESHOLD,
+            focus_layer=focus_layer,
         )
         if mount_view:
             mount_view(view)
 
-    def start_review(e):
-        if input_path.value == "No directory selected" or output_path.value == "No directory selected":
-            page.snack_bar = ft.SnackBar(ft.Text("Please select both input and output directories!"))
+    def start_manual_for_image(image_num: int, visit_name):
+        """
+        Open manual corresponding-point correction for the selected result image.
+
+        Does **not** re-run automatic slice alignment. Uses the VisitPlan(s)
+        retained from the completed Run Registration.
+        """
+        plans = list(review_state.get("plans") or [])
+        if not plans:
+            page.snack_bar = ft.SnackBar(
+                ft.Text("Run Registration first, then Review & Correct from the results screen.")
+            )
             page.snack_bar.open = True
             page.update()
             return
-        _last_progress_ts[0] = 0.0
-        schedule_log("--- Analyzing for review (auto-alignment) ---")
 
-        def work():
-            try:
-                visits = discover_visits(input_path.value)
-                if not visits:
-                    schedule_log("ERROR: No valid Visit folders found.", color=ft.Colors.RED_400)
-                    page.run_task(ui_complete, False)
-                    return
-                plans = []
-                total = len(visits)
-                for v_idx, vd in enumerate(visits):
-                    def prep_cb(val, status, _b=v_idx, _t=total):
-                        schedule_progress((_b + val) / _t, status)
-                    with contextlib.redirect_stdout(JournalRedirector()):
-                        plan = prepare_visit(vd, progress_callback=prep_cb, log_callback=schedule_log)
-                    plans.append(plan)
-                page.run_task(open_manual_view, plans)
-            except Exception as exc:
-                schedule_log(f"ERROR: {exc}", color=ft.Colors.RED_400)
-                page.run_task(ui_complete, False)
+        focus_layer = image_num - 1  # image1 → layer 0
+        for plan in plans:
+            n_layers = len(plan.folder_contents[plan.sorted_captures[0]])
+            if focus_layer < 0 or focus_layer >= n_layers:
+                page.snack_bar = ft.SnackBar(
+                    ft.Text(
+                        f"image{image_num} is out of range "
+                        f"({n_layers} layer(s) in {plan.visit_name})."
+                    )
+                )
+                page.snack_bar.open = True
+                page.update()
+                return
 
-        page.run_thread(work)
+        # Prefer the visit matching the reviewed result file.
+        if visit_name:
+            preferred = [p for p in plans if p.visit_name == visit_name]
+            if preferred:
+                plans = preferred + [p for p in plans if p.visit_name != visit_name]
 
-    async def show_results(patient_output_dir, corrections_summary):
-        view = create_results_view(
-            page,
-            patient_output_dir,
-            on_back=go_dashboard,
-            corrections_summary=corrections_summary,
+        review_state["focus_layer"] = focus_layer
+        review_state["focus_visit"] = visit_name
+        schedule_log(
+            f"--- Manual registration for image{image_num}"
+            + (f" ({visit_name})" if visit_name else "")
+            + " (no re-alignment) ---"
         )
-        if mount_view:
-            mount_view(view)
+        page.run_task(open_manual_view, plans, focus_layer)
 
     def handle_finalize(overrides_by_visit, points_by_visit):
         plans = review_state["plans"]
@@ -266,22 +329,26 @@ def create_dashboard(page: ft.Page, mount_view=None):
         auto_tuning_val = auto_tuning_switch.value
         input_dir = input_path.value
         output_dir = output_path.value
+        focus_layer = review_state.get("focus_layer")
         _last_progress_ts[0] = 0.0
         go_dashboard()
-        schedule_log("--- Finalizing with manual corrections ---")
+        focus_label = (
+            f"image{focus_layer + 1}" if focus_layer is not None else "manual points"
+        )
+        schedule_log(
+            f"--- Finalizing: applying {focus_label} registration params "
+            "to all result images ---"
+        )
 
         def work():
             success = False
+            patient_output_dir = None
             try:
                 patient_name = os.path.basename(input_dir.rstrip(os.sep))
                 patient_output_dir = os.path.join(output_dir, patient_name)
                 os.makedirs(patient_output_dir, exist_ok=True)
+                review_state["patient_output_dir"] = patient_output_dir
 
-                session = {
-                    "patient": patient_name,
-                    "confidence_threshold": DEFAULT_CONFIDENCE_THRESHOLD,
-                    "visits": {},
-                }
                 total = len(plans)
                 with contextlib.redirect_stdout(JournalRedirector()):
                     for v_idx, plan in enumerate(plans):
@@ -297,32 +364,25 @@ def create_dashboard(page: ft.Page, mount_view=None):
                             apply_clahe_to_ref=apply_clahe_val,
                             automate_tuning=auto_tuning_val,
                             matrix_overrides=ov,
+                            source_layer=focus_layer,
                             progress_callback=fin_cb,
                             log_callback=schedule_log,
                         )
-                        session["visits"][plan.visit_name] = {
-                            "scores": list(plan.scores),
-                            "auto_matrices": [m.tolist() for m in plan.matrices],
-                            "overrides": {str(k): v.tolist() for k, v in (ov or {}).items()},
-                            "points": {
-                                str(k): pt for k, pt in points_by_visit.get(plan.visit_name, {}).items()
-                            },
-                        }
                         if not ok:
                             schedule_log(f"ERROR finalizing visit {plan.visit_name}.", color=ft.Colors.RED_400)
                             break
                     else:
                         success = True
-                save_session(patient_output_dir, session)
-                schedule_log(f"Saved alignment session to {patient_output_dir}.")
+                        schedule_log(
+                            f"Saved corrected stack images to {patient_output_dir}."
+                        )
             except Exception as exc:
                 schedule_log(f"ERROR: {exc}", color=ft.Colors.RED_400)
-            page.run_task(ui_complete, success)
-            if success:
-                corrections = {
-                    v: sorted(d.keys()) for v, d in (overrides_by_visit or {}).items() if d
-                }
-                page.run_task(show_results, patient_output_dir, corrections)
+            corrections = {
+                v: sorted(d.keys()) for v, d in (overrides_by_visit or {}).items() if d
+            }
+            review_state["last_corrections"] = corrections if success else None
+            page.run_task(ui_complete, success, True)
 
         page.run_thread(work)
 
@@ -348,17 +408,13 @@ def create_dashboard(page: ft.Page, mount_view=None):
                     height=50,
                     expand=True,
                 ),
-                ft.OutlinedButton(
-                    "Review & Correct",
-                    icon=ft.Icons.TUNE,
-                    tooltip="Analyze alignment, then manually fix low-confidence captures "
-                            "with corresponding points before finalizing.",
-                    on_click=start_review,
-                    height=50,
-                    expand=True,
-                    visible=mount_view is not None,
-                ),
             ], spacing=12),
+            ft.Text(
+                "After registration finishes, a review screen lets you inspect "
+                "image1–image4 and start Review & Correct for a selected image.",
+                size=12,
+                color=ft.Colors.GREY_500,
+            ),
         ], spacing=15),
         padding=20,
         expand=True,
