@@ -102,21 +102,29 @@ def create_results_view(
     def _visits_for_image(image_num):
         return sorted(by_image.get(image_num, {}).keys())
 
-    def refresh_preview():
+    def refresh_preview(*, do_update: bool = True):
         image_num = state["image_num"]
         if image_num is None:
             preview.src = _EMPTY_PNG
             filename_label.value = ""
             status.value = "No generated .tif images found in the output folder."
             status.color = ft.Colors.AMBER_400
-            page.update()
+            if do_update:
+                try:
+                    page.update()
+                except Exception:
+                    pass
             return
 
         visits = _visits_for_image(image_num)
         if not visits:
             status.value = f"No files for image{image_num}."
             status.color = ft.Colors.AMBER_400
-            page.update()
+            if do_update:
+                try:
+                    page.update()
+                except Exception:
+                    pass
             return
 
         if state["visit"] not in visits:
@@ -141,7 +149,11 @@ def create_results_view(
             filename_label.value = os.path.basename(path)
             status.value = f"Could not load image: {ex}"
             status.color = ft.Colors.RED_400
-        page.update()
+        if do_update:
+            try:
+                page.update()
+            except Exception:
+                pass
 
     def on_image_change(e):
         if image_dd.value is None:
@@ -161,8 +173,31 @@ def create_results_view(
 
     def review_click(e):
         if on_review_correct is None or state["image_num"] is None:
+            page.snack_bar = ft.SnackBar(
+                ft.Text("Select a result image first, then press Review & Correct.")
+            )
+            page.snack_bar.open = True
+            try:
+                page.update()
+            except Exception:
+                pass
             return
-        on_review_correct(state["image_num"], state["visit"])
+        # Ensure visit is resolved before leaving this screen.
+        if state["visit"] is None:
+            visits = _visits_for_image(state["image_num"])
+            if visits:
+                state["visit"] = visits[0]
+        try:
+            on_review_correct(state["image_num"], state["visit"])
+        except Exception as ex:
+            page.snack_bar = ft.SnackBar(
+                ft.Text(f"Could not open manual registration: {ex}")
+            )
+            page.snack_bar.open = True
+            try:
+                page.update()
+            except Exception:
+                pass
 
     summary_lines = []
     if corrections_summary:
@@ -219,5 +254,6 @@ def create_results_view(
         body,
     ], expand=True, spacing=8)
 
-    refresh_preview()
+    # Build initial state without page.update — view is not mounted yet.
+    refresh_preview(do_update=False)
     return view
