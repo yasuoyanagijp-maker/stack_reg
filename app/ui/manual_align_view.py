@@ -4,24 +4,55 @@ import numpy as np
 from app.core.registration import (
     estimate_affine_from_correspondences,
     compute_alignment_cc,
+    seed_correspondences_from_matrix,
+    extract_feature_correspondences,
+    correspondence_residuals,
+    filter_correspondences_by_residual,
+    nudge_affine_matrix,
 )
-from app.core.manual_align import to_png_bytes, make_overlay, draw_landmarks
+from app.core.manual_align import (
+    to_png_bytes,
+    make_overlay,
+    draw_landmarks,
+    draw_diagnostic_matches,
+    nearest_landmark_index,
+)
 
-DISPLAY_W = 360
+DISPLAY_W_MAX = 360
+DISPLAY_W_MIN = 160
+LEFT_PANEL_W = 280
+# Divider + row spacing + page chrome reserved outside the three image panels.
+_EDITOR_GUTTER = 80
+# Hit radius in *display* pixels for selecting / dragging a pin.
+_PIN_HIT_PX = 14.0
+# Legacy alias used for placeholder tile generation.
+DISPLAY_W = DISPLAY_W_MAX
 
 
-def _placeholder_png(text: str = "No capture selected") -> bytes:
+def fit_display_width(page_width: float | None, *, n_images: int = 3) -> int:
     """
-    A neutral DISPLAY_W x DISPLAY_W panel shown in the image slots before a
-    capture is selected. Keeping the images always visible (rather than
-    ``visible=False``) preserves the editor layout: collapsing them makes the
-    whole panel (captions, buttons, status) fail to render in Flet 0.84.
+    Choose a per-image display width so reference / source / overlay fit in
+    ``page_width`` beside the left capture list (no horizontal clipping).
+    """
+    pw = float(page_width) if page_width and page_width > 0 else 1100.0
+    avail = pw - LEFT_PANEL_W - _EDITOR_GUTTER
+    w = int(avail // max(1, n_images))
+    return max(DISPLAY_W_MIN, min(DISPLAY_W_MAX, w))
+
+
+def _placeholder_png(text: str = "No capture selected", side: int = DISPLAY_W) -> bytes:
+    """
+    A neutral square panel shown in the image slots before a capture is
+    selected. Keeping the images always visible (rather than ``visible=False``)
+    preserves the editor layout: collapsing them makes the whole panel
+    (captions, buttons, status) fail to render in Flet 0.84.
     An empty ``src`` is also not an option - it renders an error box.
     """
     import cv2
-    canvas = np.full((DISPLAY_W, DISPLAY_W), 24, dtype=np.uint8)
+    side = max(64, int(side))
+    canvas = np.full((side, side), 24, dtype=np.uint8)
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)
-    cv2.putText(canvas, text, ((DISPLAY_W - tw) // 2, (DISPLAY_W + th) // 2),
+    cv2.putText(canvas, text, ((side - tw) // 2, (side + th) // 2),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, 110, 1, cv2.LINE_AA)
     return to_png_bytes(canvas)
 
@@ -91,20 +122,42 @@ def create_manual_align_view(
     # --- Correction state -------------------------------------------------
     # overrides[visit][capture_idx] = 2x3 float32 matrix
     overrides = {p.visit_name: {} for p in plans}
+    # excluded[visit] = set of capture indices omitted from the average
+    excluded = {p.visit_name: set() for p in plans}
     # points[(visit, capture_idx)] = {"ref": [[x,y]...], "src": [[x,y]...]} (full-image coords)
+    # Manual pin landmarks (proposal 2) — typically 3–8 editable pairs.
     points = {}
+    # diag[(visit, capture)] = {"ref": Nx2, "src": Nx2} automatic ORB matches (proposal 1)
+    diag = {}
 
-    state = {"visit": plans[0].visit_name, "capture": None, "disp_scale": 1.0}
+    _page_w = getattr(page, "width", None)
+    if not _page_w:
+        _page_w = getattr(getattr(page, "window", None), "width", None)
+    initial_w = fit_display_width(_page_w)
+    _prev_on_resize = page.on_resize
+    state = {
+        "visit": plans[0].visit_name,
+        "capture": None,
+        "disp_scale": 1.0,
+        "disp_w": initial_w,
+        "residual_px": 8.0,
+        "show_diag": True,
+        "nudge_step": 2.0,
+        # {"which": "ref"|"src", "idx": int} while dragging / after select
+        "selected": None,
+        "dragging": False,
+        "suppress_add": False,
+    }
 
     # --- Controls ---------------------------------------------------------
     visit_row = ft.Row(wrap=True, spacing=6)
     capture_list = ft.ListView(expand=True, spacing=4, padding=4)
 
-    ref_img = ft.Image(width=DISPLAY_W, height=DISPLAY_W, fit=ft.BoxFit.FILL,
+    ref_img = ft.Image(width=initial_w, height=initial_w, fit=ft.BoxFit.FILL,
                        border_radius=6, src=_PLACEHOLDER_PNG)
-    src_img = ft.Image(width=DISPLAY_W, height=DISPLAY_W, fit=ft.BoxFit.FILL,
+    src_img = ft.Image(width=initial_w, height=initial_w, fit=ft.BoxFit.FILL,
                        border_radius=6, src=_PLACEHOLDER_PNG)
-    preview_img = ft.Image(width=DISPLAY_W, height=DISPLAY_W, fit=ft.BoxFit.FILL,
+    preview_img = ft.Image(width=initial_w, height=initial_w, fit=ft.BoxFit.FILL,
                            border_radius=6, src=_PREVIEW_PLACEHOLDER_PNG)
 
     layer_hint = (
@@ -131,6 +184,97 @@ def create_manual_align_view(
         s = state["disp_scale"]
         return [[x / s, y / s] for (x, y) in full_pts]
 
+    def _disp_w() -> int:
+        return int(state["disp_w"])
+
+    def _apply_display_width(new_w: int, *, force: bool = False):
+        """Resize the three image panels to ``new_w`` and refresh content."""
+        new_w = max(DISPLAY_W_MIN, min(DISPLAY_W_MAX, int(new_w)))
+        if not force and new_w == state.get("disp_w"):
+            return
+        state["disp_w"] = new_w
+        ref_img.width = new_w
+        src_img.width = new_w
+        preview_img.width = new_w
+        cap = state["capture"]
+        if cap is None:
+            ref_img.height = new_w
+            src_img.height = new_w
+            preview_img.height = new_w
+            ref_img.src = _placeholder_png("No capture selected", side=new_w)
+            src_img.src = _placeholder_png("No capture selected", side=new_w)
+            preview_img.src = _placeholder_png("No preview computed", side=new_w)
+            try:
+                page.update()
+            except Exception:
+                pass
+            return
+        render_images()
+        plan = plans_by_name[state["visit"]]
+        try:
+            if cap == 0:
+                stack = display_stack_for(plan)
+                preview_img.src = to_png_bytes(stack[0], max_side=new_w)
+            else:
+                _refresh_preview(plan, cap)
+        except Exception:
+            pass
+
+    def _on_page_resize(e):
+        pw = getattr(e, "width", None) or getattr(page, "width", None)
+        _apply_display_width(fit_display_width(pw))
+        if _prev_on_resize is not None:
+            _prev_on_resize(e)
+
+    def _stored_matrix(plan, cap):
+        return overrides[plan.visit_name].get(cap, plan.matrices[cap])
+
+    def _current_matrix(plan, cap):
+        """Preview / nudge base: pending → baseline → accepted/auto."""
+        if state.get("_pending_matrix") is not None:
+            return state["_pending_matrix"]
+        if state.get("_baseline_matrix") is not None:
+            return state["_baseline_matrix"]
+        return _stored_matrix(plan, cap)
+
+    def _set_matrix(matrix, *, acceptible: bool = True):
+        """Remember matrix for preview; optionally make it Accept-ready."""
+        m = np.asarray(matrix, dtype=np.float32).reshape(2, 3).copy()
+        state["_baseline_matrix"] = m
+        if acceptible:
+            state["_pending_matrix"] = m
+        else:
+            state.pop("_pending_matrix", None)
+
+    def _sync_src_pins_to_matrix(matrix):
+        """Keep ref pin positions; rewrite src pins so they match ``matrix``."""
+        pts = cur_points()
+        refs = pts["ref"]
+        if not refs:
+            return
+        m = np.asarray(matrix, dtype=np.float64).reshape(2, 3)
+        pts["src"] = [
+            [
+                float(m[0, 0] * x + m[0, 1] * y + m[0, 2]),
+                float(m[1, 0] * x + m[1, 1] * y + m[1, 2]),
+            ]
+            for x, y in refs
+        ]
+
+    def _refresh_preview(plan, cap, *, note: str = ""):
+        try:
+            _show_matrix_preview(plan, cap, _current_matrix(plan, cap), note=note)
+        except Exception:
+            pass
+
+    def _diag_mask(plan, cap, matrix):
+        key = (plan.visit_name, cap)
+        d = diag.get(key)
+        if not d:
+            return None
+        resid = correspondence_residuals(d["ref"], d["src"], matrix)
+        return resid <= float(state["residual_px"])
+
     def render_images():
         plan = plans_by_name[state["visit"]]
         cap = state["capture"]
@@ -139,16 +283,39 @@ def create_manual_align_view(
         stack = display_stack_for(plan)
         ref_full = stack[0]
         src_full = stack[cap]
-        ref_disp, disp_h, scale = _resize_for_display(ref_full)
-        src_disp, _, _ = _resize_for_display(src_full)
+        dw = _disp_w()
+        ref_disp, disp_h, scale = _resize_for_display(ref_full, width=dw)
+        src_disp, _, _ = _resize_for_display(src_full, width=dw)
         state["disp_scale"] = scale
+        ref_img.width = dw
+        src_img.width = dw
+        preview_img.width = dw
         ref_img.height = disp_h
         src_img.height = disp_h
         preview_img.height = disp_h
 
+        # Optional diagnostic ORB matches under the pin landmarks.
+        if state["show_diag"] and cap != 0:
+            matrix = _current_matrix(plan, cap)
+            mask = _diag_mask(plan, cap, matrix)
+            key = (plan.visit_name, cap)
+            if mask is not None and key in diag:
+                s = state["disp_scale"]
+                ref_d = diag[key]["ref"] / s
+                src_d = diag[key]["src"] / s
+                ref_disp = draw_diagnostic_matches(ref_disp, ref_d, mask)
+                src_disp = draw_diagnostic_matches(src_disp, src_d, mask)
+
         pts = cur_points()
-        ref_marked = draw_landmarks(ref_disp, to_display_pts(pts["ref"]), color=(0, 255, 0))
-        src_marked = draw_landmarks(src_disp, to_display_pts(pts["src"]), color=(255, 0, 255))
+        sel = state.get("selected")
+        ref_sel = sel["idx"] if sel and sel["which"] == "ref" else None
+        src_sel = sel["idx"] if sel and sel["which"] == "src" else None
+        ref_marked = draw_landmarks(
+            ref_disp, to_display_pts(pts["ref"]), color=(0, 255, 0), selected_idx=ref_sel
+        )
+        src_marked = draw_landmarks(
+            src_disp, to_display_pts(pts["src"]), color=(255, 0, 255), selected_idx=src_sel
+        )
         ref_img.src = to_png_bytes(ref_marked)
         src_img.src = to_png_bytes(src_marked)
         ref_caption.value = (
@@ -159,24 +326,65 @@ def create_manual_align_view(
         )
         page.update()
 
+    def _show_matrix_preview(plan, cap, matrix, *, note: str = ""):
+        stack = display_stack_for(plan)
+        overlay = make_overlay(stack[0], stack[cap], matrix)
+        preview_img.src = to_png_bytes(overlay, max_side=_disp_w())
+        cc = compute_alignment_cc(stack[0], stack[cap], matrix)
+        n_in = n_tot = None
+        mask = _diag_mask(plan, cap, matrix)
+        if mask is not None:
+            n_in, n_tot = int(mask.sum()), int(mask.size)
+        parts = [f"Score: {cc:.3f}"]
+        if n_tot is not None:
+            parts.append(f"ORB inliers: {n_in}/{n_tot} (≤{state['residual_px']:.0f}px)")
+        if note:
+            parts.append(note)
+        cc_text.value = "   ".join(parts)
+        cc_text.color = ft.Colors.CYAN_200
+        page.update()
+
+    def _load_diagnostics(plan, idx):
+        key = (plan.visit_name, idx)
+        if key in diag:
+            return
+        stack = display_stack_for(plan)
+        extracted = extract_feature_correspondences(stack[0], stack[idx])
+        if extracted is None:
+            diag[key] = None
+            return
+        ref_pts, src_pts = extracted
+        diag[key] = {"ref": ref_pts, "src": src_pts}
+
     def refresh_capture_list(*, do_update: bool = True):
         plan = plans_by_name[state["visit"]]
         capture_list.controls.clear()
-        for idx in range(1, len(plan.matrices)):  # skip anchor (capture 0)
+        for idx in range(0, len(plan.matrices)):  # include Capture 1 (reference)
+            is_excl = idx in excluded[plan.visit_name]
             corrected = idx in overrides[plan.visit_name]
-            if corrected:
+            is_ref = idx == 0
+            if is_excl:
+                badge, col = "excluded", ft.Colors.RED_400
+                icon = ft.Icons.BLOCK
+            elif is_ref:
+                badge, col = "reference", ft.Colors.CYAN_300
+                icon = ft.Icons.PUSH_PIN
+            elif corrected:
                 badge, col = "corrected", ft.Colors.GREEN_400
                 icon = ft.Icons.CHECK_CIRCLE
             else:
-                badge, col = "review", ft.Colors.GREY_400
+                badge, col = "auto", ft.Colors.GREY_400
                 icon = ft.Icons.CIRCLE_OUTLINED
             selected = idx == state["capture"]
+            label = f"Capture {idx+1}"
+            if is_ref:
+                label += " (ref)"
+            label += f" — {_short_name(_capture_folder(plan, idx))}"
             capture_list.controls.append(
                 ft.Container(
                     content=ft.Row([
                         ft.Icon(icon, color=col, size=16),
-                        ft.Text(f"Capture {idx+1} — {_short_name(_capture_folder(plan, idx))}",
-                                size=13,
+                        ft.Text(label, size=13,
                                 weight=ft.FontWeight.BOLD if selected else ft.FontWeight.NORMAL),
                         ft.Container(expand=True),
                         ft.Text(badge, size=11, color=col),
@@ -193,51 +401,196 @@ def create_manual_align_view(
             except Exception:
                 pass
 
+    def _seed_auto_points(plan, idx, *, force: bool = False):
+        """Prefill editable landmarks from the current auto / accepted matrix."""
+        key = (plan.visit_name, idx)
+        if not force and key in points and (points[key]["ref"] or points[key]["src"]):
+            return
+        stack = display_stack_for(plan)
+        h, w = stack[0].shape[:2]
+        matrix = overrides[plan.visit_name].get(idx, plan.matrices[idx])
+        ref_pts, src_pts = seed_correspondences_from_matrix(matrix, h, w, n_points=6)
+        points[key] = {"ref": ref_pts, "src": src_pts}
+        tx, ty = float(matrix[0, 2]), float(matrix[1, 2])
+        status_text.value = (
+            f"Capture {idx+1}: auto shift ≈ ({tx:.1f}, {ty:.1f}) px — 6 editable pins "
+            f"+ ORB diagnostics. Nudge overlay, drop outliers, or edit pins → Compute."
+        )
+
     def select_capture(idx):
         state["capture"] = idx
         preview_img.src = _PREVIEW_PLACEHOLDER_PNG
         cc_text.value = ""
+        plan = plans_by_name[state["visit"]]
+        state.pop("_pending_matrix", None)
+        state["_baseline_matrix"] = None
+
+        # Capture 1 (index 0) is the alignment reference — point editing N/A,
+        # but it can still be excluded from the average if quality is poor.
+        if idx == 0:
+            if idx in excluded[state["visit"]]:
+                status_text.value = (
+                    "Capture 1 (reference) is EXCLUDED from the average. "
+                    "Toggle Exclude off to include it again."
+                )
+            else:
+                status_text.value = (
+                    "Capture 1 is the alignment reference (identity). "
+                    "Point correction is not needed; use Exclude if this capture "
+                    "should be omitted from the average."
+                )
+            try:
+                stack = display_stack_for(plan)
+                # Show reference alone (no warp overlay).
+                preview_img.src = to_png_bytes(stack[0], max_side=_disp_w())
+                cc_text.value = "Reference capture — Exclude available"
+                cc_text.color = ft.Colors.GREY_300
+            except Exception:
+                pass
+            refresh_capture_list()
+            render_images()
+            return
+
+        _seed_auto_points(plan, idx, force=False)
+        try:
+            _load_diagnostics(plan, idx)
+        except Exception:
+            pass
         n_ref = len(cur_points()["ref"])
         n_src = len(cur_points()["src"])
-        status_text.value = (
-            f"Capture {idx+1}: click matching landmarks — same feature on both images "
-            f"(≥3 pairs). Points: ref {n_ref}, src {n_src}."
-        )
+        if idx in excluded[state["visit"]]:
+            status_text.value = (
+                f"Capture {idx+1} is EXCLUDED from the average. "
+                f"Toggle Exclude off to include it again."
+            )
+        elif not status_text.value.startswith(f"Capture {idx+1}: auto shift"):
+            status_text.value = (
+                f"Capture {idx+1}: {n_ref}/{n_src} pins + ORB diagnostics. "
+                f"Nudge, drop outliers, or edit pins → Compute & Preview."
+            )
+        try:
+            matrix = _stored_matrix(plan, idx)
+            _set_matrix(matrix, acceptible=False)
+            _show_matrix_preview(plan, idx, matrix, note="baseline")
+        except Exception:
+            pass
         refresh_capture_list()
         render_images()
 
     def select_visit(name):
         state["visit"] = name
         state["capture"] = None
+        state.pop("_pending_matrix", None)
+        state["_baseline_matrix"] = None
         refresh_capture_list()
-        ref_img.src = _PLACEHOLDER_PNG
-        src_img.src = _PLACEHOLDER_PNG
-        preview_img.src = _PREVIEW_PLACEHOLDER_PNG
-        ref_img.height = DISPLAY_W
-        src_img.height = DISPLAY_W
-        preview_img.height = DISPLAY_W
+        dw = _disp_w()
+        ref_img.width = dw
+        src_img.width = dw
+        preview_img.width = dw
+        ref_img.height = dw
+        src_img.height = dw
+        preview_img.height = dw
+        ref_img.src = _placeholder_png("No capture selected", side=dw)
+        src_img.src = _placeholder_png("No capture selected", side=dw)
+        preview_img.src = _placeholder_png("No preview computed", side=dw)
         plan = plans_by_name[name]
         ref_caption.value = f"Reference (Capture 1 — {_short_name(_capture_folder(plan, 0))})"
         src_caption.value = "Source"
         status_text.value = f"Select a capture on the left to begin{layer_hint}."
         page.update()
 
-    def add_point(which, e):
-        if state["capture"] is None:
-            return
+    def _event_xy(e):
         pos = getattr(e, "local_position", None)
         if pos is None:
+            return None
+        return float(pos.x), float(pos.y)
+
+    def _hit_pin(which, disp_x, disp_y):
+        disp_pts = to_display_pts(cur_points()[which])
+        return nearest_landmark_index(disp_pts, disp_x, disp_y, _PIN_HIT_PX)
+
+    def add_point(which, e):
+        if state["capture"] is None or state["capture"] == 0:
+            return
+        if state.get("suppress_add"):
+            state["suppress_add"] = False
+            return
+        xy = _event_xy(e)
+        if xy is None:
+            return
+        # Tap on an existing pin → select it (drag handles the move).
+        hit = _hit_pin(which, xy[0], xy[1])
+        if hit is not None:
+            state["selected"] = {"which": which, "idx": hit}
+            status_text.value = (
+                f"Selected {which} pin #{hit + 1}. Drag to move, or Delete selected."
+            )
+            render_images()
             return
         s = state["disp_scale"]
-        fx, fy = pos.x * s, pos.y * s
+        fx, fy = xy[0] * s, xy[1] * s
         cur_points()[which].append([fx, fy])
+        state["selected"] = {"which": which, "idx": len(cur_points()[which]) - 1}
+        # Keep nudged/baseline overlay; Accept requires Compute after pin edits.
+        state.pop("_pending_matrix", None)
         n_ref = len(cur_points()["ref"])
         n_src = len(cur_points()["src"])
         status_text.value = (
             f"Points: ref {n_ref}, src {n_src}. "
-            + ("Ready to compute." if (n_ref == n_src and n_ref >= 3)
-               else "Add matching pairs (≥3, equal counts).")
+            + ("Ready — Compute & Preview." if (n_ref == n_src and n_ref >= 3)
+               else "Add matching pairs (≥3, equal counts). Overlay keeps last nudge.")
         )
+        plan = plans_by_name[state["visit"]]
+        _refresh_preview(plan, state["capture"], note="pins editing")
+        render_images()
+
+    def pan_start(which, e):
+        if state["capture"] is None or state["capture"] == 0:
+            return
+        xy = _event_xy(e)
+        if xy is None:
+            return
+        hit = _hit_pin(which, xy[0], xy[1])
+        if hit is None:
+            state["dragging"] = False
+            return
+        state["selected"] = {"which": which, "idx": hit}
+        state["dragging"] = True
+        state["suppress_add"] = True
+        status_text.value = f"Dragging {which} pin #{hit + 1}…"
+        render_images()
+
+    def pan_update(which, e):
+        if not state.get("dragging"):
+            return
+        sel = state.get("selected")
+        if not sel or sel["which"] != which:
+            return
+        xy = _event_xy(e)
+        if xy is None:
+            return
+        s = state["disp_scale"]
+        pts = cur_points()[which]
+        idx = sel["idx"]
+        if idx < 0 or idx >= len(pts):
+            return
+        pts[idx] = [xy[0] * s, xy[1] * s]
+        state.pop("_pending_matrix", None)
+        render_images()
+
+    def pan_end(which, e):
+        if not state.get("dragging"):
+            return
+        state["dragging"] = False
+        sel = state.get("selected")
+        if sel and sel["which"] == which:
+            status_text.value = (
+                f"Moved {which} pin #{sel['idx'] + 1}. "
+                f"Overlay keeps last nudge — Compute & Preview to refit."
+            )
+        state["suppress_add"] = True
+        plan = plans_by_name[state["visit"]]
+        _refresh_preview(plan, state["capture"], note="pins editing")
         render_images()
 
     def undo_point(which, e):
@@ -246,20 +599,116 @@ def create_manual_align_view(
         pts = cur_points()[which]
         if pts:
             pts.pop()
+        state["selected"] = None
+        state.pop("_pending_matrix", None)
+        plan = plans_by_name[state["visit"]]
+        _refresh_preview(plan, state["capture"], note="pins editing")
+        render_images()
+
+    def delete_selected(e):
+        if state["capture"] is None:
+            return
+        sel = state.get("selected")
+        if not sel:
+            status_text.value = "No pin selected. Click or drag a numbered pin first."
+            page.update()
+            return
+        which, idx = sel["which"], sel["idx"]
+        pts = cur_points()
+        # Prefer deleting the paired index on both sides when counts match.
+        n_ref, n_src = len(pts["ref"]), len(pts["src"])
+        if n_ref == n_src and 0 <= idx < n_ref:
+            pts["ref"].pop(idx)
+            pts["src"].pop(idx)
+            status_text.value = f"Deleted pair #{idx + 1} from both images."
+        elif 0 <= idx < len(pts[which]):
+            pts[which].pop(idx)
+            status_text.value = f"Deleted {which} pin #{idx + 1}."
+        else:
+            status_text.value = "Selected pin no longer exists."
+        state["selected"] = None
+        state.pop("_pending_matrix", None)
         render_images()
 
     def reset_points(e):
         if state["capture"] is None:
             return
+        plan = plans_by_name[state["visit"]]
+        _seed_auto_points(plan, state["capture"], force=True)
+        state["selected"] = None
+        matrix = _stored_matrix(plan, state["capture"])
+        _set_matrix(matrix, acceptible=False)
+        status_text.value = (
+            "Pins reset to automatic landmarks. Drag a numbered pin to adjust."
+        )
+        try:
+            _show_matrix_preview(plan, state["capture"], matrix, note="reset")
+        except Exception:
+            preview_img.src = _PREVIEW_PLACEHOLDER_PNG
+            cc_text.value = ""
+        render_images()
+
+    def clear_points(e):
+        if state["capture"] is None:
+            return
+        if state["capture"] == 0:
+            status_text.value = "Capture 1 (ref) has no editable pins."
+            page.update()
+            return
         key = (state["visit"], state["capture"])
         points[key] = {"ref": [], "src": []}
-        preview_img.src = _PREVIEW_PLACEHOLDER_PNG
-        cc_text.value = ""
-        status_text.value = "Points cleared."
+        state["selected"] = None
+        # Keep nudged / baseline transform so user can place fresh points after nudge.
+        plan = plans_by_name[state["visit"]]
+        cap = state["capture"]
+        if state.get("_pending_matrix") is None and state.get("_baseline_matrix") is not None:
+            # Pins wiped after edits — nudge/baseline still Accept-able until new pins added.
+            state["_pending_matrix"] = np.asarray(
+                state["_baseline_matrix"], dtype=np.float32
+            ).copy()
+        status_text.value = (
+            "Pins cleared — overlay nudge kept. Now click matching landmarks "
+            "(ref green → source magenta), ≥3 pairs, then Compute & Preview."
+        )
+        _refresh_preview(plan, cap, note="ready for new pins")
         render_images()
+
+    def toggle_exclude(e):
+        if state["capture"] is None:
+            return
+        visit = state["visit"]
+        idx = state["capture"]
+        plan = plans_by_name[visit]
+        n_caps = len(plan.matrices)
+        if idx in excluded[visit]:
+            excluded[visit].discard(idx)
+            status_text.value = f"Capture {idx+1} included in the average again."
+        else:
+            # Keep at least one capture in the average.
+            remaining = n_caps - len(excluded[visit]) - 1
+            if remaining < 1:
+                status_text.value = (
+                    "Cannot exclude every capture — at least one must remain for averaging."
+                )
+                page.update()
+                return
+            excluded[visit].add(idx)
+            overrides[visit].pop(idx, None)
+            state.pop("_pending_matrix", None)
+            status_text.value = (
+                f"Capture {idx+1} EXCLUDED from average (poor quality / unalignable)."
+            )
+        refresh_capture_list()
+        page.update()
 
     def compute_preview(e):
         if state["capture"] is None:
+            return
+        if state["capture"] == 0:
+            status_text.value = (
+                "Capture 1 is the reference — use Exclude instead of point correction."
+            )
+            page.update()
             return
         plan = plans_by_name[state["visit"]]
         cap = state["capture"]
@@ -279,51 +728,176 @@ def create_manual_align_view(
             return
 
         stack = display_stack_for(plan)
-        ref_full = stack[0]
-        src_full = stack[cap]
-        overlay = make_overlay(ref_full, src_full, matrix)
-        auto_cc = compute_alignment_cc(ref_full, src_full, plan.matrices[cap])
-        manual_cc = compute_alignment_cc(ref_full, src_full, matrix)
-
-        preview_img.src = to_png_bytes(overlay, max_side=DISPLAY_W)
-        cc_text.value = (
-            f"Alignment score — auto: {auto_cc:.3f}   manual: {manual_cc:.3f}   "
-            + ("(better ✓)" if manual_cc >= auto_cc else "(worse — check points)")
+        auto_cc = compute_alignment_cc(stack[0], stack[cap], plan.matrices[cap])
+        manual_cc = compute_alignment_cc(stack[0], stack[cap], matrix)
+        _set_matrix(matrix, acceptible=True)
+        note = (
+            f"pins → manual {manual_cc:.3f} vs auto {auto_cc:.3f}"
+            + (" (better ✓)" if manual_cc >= auto_cc else " (worse — check pins)")
         )
+        _show_matrix_preview(plan, cap, matrix, note=note)
         cc_text.color = ft.Colors.GREEN_400 if manual_cc >= auto_cc else ft.Colors.AMBER_400
-        state["_pending_matrix"] = matrix
         status_text.value = "Preview ready. Green = reference, magenta = source; white = aligned."
+        render_images()
         page.update()
 
     def accept_correction(e):
-        mat = state.get("_pending_matrix")
-        if mat is None or state["capture"] is None:
-            status_text.value = "Compute a preview before accepting."
+        if state["capture"] == 0:
+            status_text.value = (
+                "Capture 1 is the reference — use Exclude instead of Accept."
+            )
             page.update()
             return
-        overrides[state["visit"]][state["capture"]] = mat
-        status_text.value = f"Capture {state['capture']+1} correction accepted."
+        mat = state.get("_pending_matrix")
+        if mat is None or state["capture"] is None:
+            status_text.value = "Nudge, drop outliers, or Compute & Preview before accepting."
+            page.update()
+            return
+        visit = state["visit"]
+        idx = state["capture"]
+        overrides[visit][idx] = mat
+        excluded[visit].discard(idx)
+        status_text.value = f"Capture {idx+1} correction accepted."
         refresh_capture_list()
         page.update()
 
     def revert_auto(e):
         if state["capture"] is None:
             return
-        overrides[state["visit"]].pop(state["capture"], None)
-        state.pop("_pending_matrix", None)
-        preview_img.src = _PREVIEW_PLACEHOLDER_PNG
-        cc_text.value = ""
-        status_text.value = f"Capture {state['capture']+1} reverted to automatic alignment."
+        visit = state["visit"]
+        idx = state["capture"]
+        overrides[visit].pop(idx, None)
+        excluded[visit].discard(idx)
+        plan = plans_by_name[visit]
+        _seed_auto_points(plan, idx, force=True)
+        _set_matrix(plan.matrices[idx], acceptible=False)
+        status_text.value = f"Capture {idx+1} reverted to automatic alignment landmarks."
+        try:
+            _show_matrix_preview(plan, idx, plan.matrices[idx], note="auto")
+        except Exception:
+            preview_img.src = _PREVIEW_PLACEHOLDER_PNG
+            cc_text.value = ""
         refresh_capture_list()
-        page.update()
+        render_images()
+
+    def apply_nudge(dx=0.0, dy=0.0, dtheta=0.0):
+        if state["capture"] is None or state["capture"] == 0:
+            return
+        plan = plans_by_name[state["visit"]]
+        cap = state["capture"]
+        stack = display_stack_for(plan)
+        h, w = stack[0].shape[:2]
+        base = _current_matrix(plan, cap)
+        matrix = nudge_affine_matrix(
+            base, dx=dx, dy=dy, dtheta_deg=dtheta, center=(w / 2.0, h / 2.0)
+        )
+        _set_matrix(matrix, acceptible=True)
+        pts = cur_points()
+        if pts["ref"]:
+            # Preserve user-chosen ref landmarks; slide src onto the new transform.
+            if len(pts["ref"]) == len(pts["src"]) or not pts["src"]:
+                _sync_src_pins_to_matrix(matrix)
+            else:
+                ref_pts, src_pts = seed_correspondences_from_matrix(
+                    matrix, h, w, n_points=max(3, min(8, len(pts["ref"])))
+                )
+                points[(plan.visit_name, cap)] = {"ref": ref_pts, "src": src_pts}
+            status_text.value = (
+                f"Nudged (Δx={dx:+.0f}, Δy={dy:+.0f}, Δθ={dtheta:+.1f}°). "
+                f"Drag pins to refine, or Clear points then click new pairs — "
+                f"then Compute & Preview (or Accept nudge as-is)."
+            )
+        else:
+            # Pins already cleared: keep empty so user can specify points next.
+            status_text.value = (
+                f"Nudged (Δx={dx:+.0f}, Δy={dy:+.0f}, Δθ={dtheta:+.1f}°). "
+                f"Now click matching landmarks (≥3 pairs), then Compute & Preview — "
+                f"or Accept this nudge without pins."
+            )
+        _show_matrix_preview(plan, cap, matrix, note="nudge")
+        render_images()
+
+    def drop_outliers_refit(e):
+        if state["capture"] is None or state["capture"] == 0:
+            return
+        plan = plans_by_name[state["visit"]]
+        cap = state["capture"]
+        key = (plan.visit_name, cap)
+        d = diag.get(key)
+        if not d:
+            status_text.value = "No ORB diagnostics for this capture — cannot drop outliers."
+            page.update()
+            return
+        matrix = _current_matrix(plan, cap)
+        ref_in, src_in, keep = filter_correspondences_by_residual(
+            d["ref"], d["src"], matrix, state["residual_px"]
+        )
+        if ref_in.shape[0] < 3:
+            status_text.value = (
+                f"Only {ref_in.shape[0]} inliers at ≤{state['residual_px']:.0f}px — "
+                f"relax the residual slider or nudge first."
+            )
+            page.update()
+            return
+        try:
+            new_m = estimate_affine_from_correspondences(ref_in, src_in)
+        except ValueError as ex:
+            status_text.value = f"Refit failed: {ex}"
+            page.update()
+            return
+        _set_matrix(new_m, acceptible=True)
+        pts = cur_points()
+        if pts["ref"] and len(pts["ref"]) == len(pts["src"]):
+            _sync_src_pins_to_matrix(new_m)
+        else:
+            stack = display_stack_for(plan)
+            h, w = stack[0].shape[:2]
+            ref_pts, src_pts = seed_correspondences_from_matrix(new_m, h, w, n_points=6)
+            points[key] = {"ref": ref_pts, "src": src_pts}
+        n_drop = int((~keep).sum())
+        status_text.value = (
+            f"Dropped {n_drop} outliers, refit from {ref_in.shape[0]} inliers. "
+            f"Adjust pins further or Accept."
+        )
+        _show_matrix_preview(plan, cap, new_m, note="outlier refit")
+        render_images()
+
+    def on_residual_change(e):
+        state["residual_px"] = float(e.control.value)
+        residual_label.value = f"Residual ≤ {state['residual_px']:.0f} px"
+        if state["capture"] is not None and state["capture"] != 0:
+            plan = plans_by_name[state["visit"]]
+            cap = state["capture"]
+            try:
+                _show_matrix_preview(plan, cap, _current_matrix(plan, cap))
+            except Exception:
+                pass
+            render_images()
+        else:
+            page.update()
+
+    def on_show_diag_change(e):
+        state["show_diag"] = bool(e.control.value)
+        render_images()
 
     def finalize_click(e):
         clean_overrides = {v: dict(d) for v, d in overrides.items() if d}
+        clean_excluded = {v: sorted(s) for v, s in excluded.items() if s}
         clean_points = {}
         for (visit, cap), pt in points.items():
             if visit in clean_overrides and cap in clean_overrides[visit]:
                 clean_points.setdefault(visit, {})[cap] = pt
-        on_finalize(clean_overrides, clean_points)
+        if not clean_overrides and not clean_excluded:
+            status_text.value = (
+                "No corrections or exclusions yet. Accept a preview, or Exclude a capture."
+            )
+            page.update()
+            return
+        # Prefer 3-arg callback (overrides, points, excluded); fall back for older hooks.
+        try:
+            on_finalize(clean_overrides, clean_points, clean_excluded)
+        except TypeError:
+            on_finalize(clean_overrides, clean_points)
 
     # --- Build visit selector --------------------------------------------
     for p in plans:
@@ -336,25 +910,96 @@ def create_manual_align_view(
 
     ref_gd = ft.GestureDetector(
         content=ref_img,
+        drag_interval=33,
+        mouse_cursor=ft.MouseCursor.MOVE,
         on_tap_down=lambda e: add_point("ref", e),
+        on_pan_start=lambda e: pan_start("ref", e),
+        on_pan_update=lambda e: pan_update("ref", e),
+        on_pan_end=lambda e: pan_end("ref", e),
     )
     src_gd = ft.GestureDetector(
         content=src_img,
+        drag_interval=33,
+        mouse_cursor=ft.MouseCursor.MOVE,
         on_tap_down=lambda e: add_point("src", e),
+        on_pan_start=lambda e: pan_start("src", e),
+        on_pan_update=lambda e: pan_update("src", e),
+        on_pan_end=lambda e: pan_end("src", e),
     )
+
+    step = state["nudge_step"]
+    residual_label = ft.Text(
+        f"Residual ≤ {state['residual_px']:.0f} px", size=12, color=ft.Colors.GREY_300
+    )
+    residual_slider = ft.Slider(
+        min=2, max=20, divisions=18, value=state["residual_px"],
+        label="{value} px", width=180, on_change=on_residual_change,
+    )
+    show_diag_switch = ft.Switch(
+        label="Show ORB diagnostics",
+        value=state["show_diag"],
+        on_change=on_show_diag_change,
+    )
+
+    nudge_row = ft.Row([
+        ft.Text("Nudge overlay", size=12, color=ft.Colors.GREY_300),
+        ft.OutlinedButton("←", on_click=lambda e: apply_nudge(dx=-step)),
+        ft.OutlinedButton("→", on_click=lambda e: apply_nudge(dx=+step)),
+        ft.OutlinedButton("↑", on_click=lambda e: apply_nudge(dy=-step)),
+        ft.OutlinedButton("↓", on_click=lambda e: apply_nudge(dy=+step)),
+        ft.OutlinedButton("↺", tooltip="Rotate CCW 0.5°",
+                          on_click=lambda e: apply_nudge(dtheta=+0.5)),
+        ft.OutlinedButton("↻", tooltip="Rotate CW 0.5°",
+                          on_click=lambda e: apply_nudge(dtheta=-0.5)),
+        ft.Text(f"step {step:.0f}px / 0.5°", size=11, color=ft.Colors.GREY_500),
+    ], wrap=True, spacing=6)
+
+    diag_row = ft.Row([
+        show_diag_switch,
+        residual_label,
+        residual_slider,
+        ft.FilledTonalButton(
+            "Drop outliers & refit",
+            icon=ft.Icons.FILTER_ALT,
+            on_click=drop_outliers_refit,
+        ),
+    ], wrap=True, spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
     control_row = ft.Row([
         ft.OutlinedButton("Undo ref", icon=ft.Icons.UNDO,
                           on_click=lambda e: undo_point("ref", e)),
         ft.OutlinedButton("Undo src", icon=ft.Icons.UNDO,
                           on_click=lambda e: undo_point("src", e)),
-        ft.OutlinedButton("Reset", icon=ft.Icons.CLEAR, on_click=reset_points),
+        ft.OutlinedButton(
+            "Delete selected",
+            icon=ft.Icons.DELETE_OUTLINE,
+            on_click=delete_selected,
+        ),
+        ft.OutlinedButton("Reset to auto points", icon=ft.Icons.RESTART_ALT, on_click=reset_points),
+        ft.FilledTonalButton(
+            "Clear points",
+            icon=ft.Icons.CLEAR_ALL,
+            on_click=clear_points,
+            style=ft.ButtonStyle(color=ft.Colors.AMBER_300),
+        ),
         ft.FilledButton("Compute & Preview", icon=ft.Icons.CALCULATE, on_click=compute_preview),
         ft.FilledButton("Accept", icon=ft.Icons.CHECK, on_click=accept_correction),
         ft.OutlinedButton("Revert to auto", icon=ft.Icons.RESTORE, on_click=revert_auto),
+        ft.OutlinedButton(
+            "Exclude / Include",
+            icon=ft.Icons.BLOCK,
+            on_click=toggle_exclude,
+            style=ft.ButtonStyle(color=ft.Colors.RED_300),
+        ),
     ], wrap=True, spacing=8)
 
     title_suffix = f" — image{focus_layer + 1}" if focus_layer is not None else ""
+    target_hint = (
+        f"Parameters from image{focus_layer + 1} are applied to all result images "
+        f"(image1–imageN) of this Visit only. Other Visits are not re-synthesized."
+        if focus_layer is not None
+        else "Finalize updates all result images of this Visit only."
+    )
 
     left_panel = ft.Container(
         content=ft.Column([
@@ -363,35 +1008,44 @@ def create_manual_align_view(
             ft.Divider(height=10),
             ft.Text("Captures (aligned to Capture 1)", size=14, weight=ft.FontWeight.BOLD),
             ft.Text(
-                "Select any capture to correct by eye — no automatic flagging.\n"
-                "On Finalize & Save, the same registration parameters are applied "
-                "to all result images (image1–imageN), not only the one you edited.",
+                "1) Nudge overlay  2) optional Clear points  3) click/drag pins\n"
+                "4) Compute & Preview → Accept. Nudge is kept after Clear.\n"
+                "Green/red dots = ORB diagnostics (not editable).\n"
+                f"{target_hint}",
                 size=11, color=ft.Colors.GREY_400,
             ),
             capture_list,
         ], spacing=8, expand=True),
-        width=260,
+        width=LEFT_PANEL_W,
         padding=8,
     )
 
+    images_row = ft.Row([
+        ft.Column([ref_caption, ft.Container(content=ref_gd,
+                   border=ft.Border.all(1, ft.Colors.GREEN_700), border_radius=6)]),
+        ft.Column([src_caption, ft.Container(content=src_gd,
+                   border=ft.Border.all(1, ft.Colors.PURPLE_400), border_radius=6)]),
+        ft.Column([ft.Text("Overlay preview", size=13, weight=ft.FontWeight.BOLD),
+                   ft.Container(content=preview_img,
+                   border=ft.Border.all(1, ft.Colors.CYAN_700), border_radius=6)]),
+    ], spacing=16)
+
     editor_panel = ft.Column([
-        ft.Row([
-            ft.Column([ref_caption, ft.Container(content=ref_gd,
-                       border=ft.Border.all(1, ft.Colors.GREEN_700), border_radius=6)]),
-            ft.Column([src_caption, ft.Container(content=src_gd,
-                       border=ft.Border.all(1, ft.Colors.PURPLE_400), border_radius=6)]),
-            ft.Column([ft.Text("Overlay preview", size=13, weight=ft.FontWeight.BOLD),
-                       ft.Container(content=preview_img,
-                       border=ft.Border.all(1, ft.Colors.CYAN_700), border_radius=6)]),
-        ], spacing=16, scroll=ft.ScrollMode.AUTO),
+        images_row,
+        nudge_row,
+        diag_row,
         control_row,
         status_text,
         cc_text,
     ], spacing=12, expand=True, scroll=ft.ScrollMode.AUTO)
 
+    def _go_back(e=None):
+        page.on_resize = _prev_on_resize
+        on_back()
+
     header = ft.Row([
         ft.IconButton(icon=ft.Icons.ARROW_BACK, tooltip="Back",
-                      on_click=lambda e: on_back()),
+                      on_click=_go_back),
         ft.Text(f"Manual Corresponding-Point Correction{title_suffix}", size=22,
                 weight=ft.FontWeight.BOLD, color=ft.Colors.CYAN_400),
         ft.Container(expand=True),
@@ -405,6 +1059,8 @@ def create_manual_align_view(
         ft.Divider(height=10),
         ft.Row([left_panel, ft.VerticalDivider(width=1), editor_panel], expand=True),
     ], expand=True, spacing=8)
+
+    page.on_resize = _on_page_resize
 
     # Initialize selection without page.update — view is not mounted yet.
     refresh_capture_list(do_update=False)

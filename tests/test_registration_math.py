@@ -5,6 +5,11 @@ import pytest
 from app.core.registration import (
     estimate_affine_from_correspondences,
     compute_alignment_cc,
+    seed_correspondences_from_matrix,
+    extract_feature_correspondences,
+    correspondence_residuals,
+    filter_correspondences_by_residual,
+    nudge_affine_matrix,
 )
 
 
@@ -69,3 +74,54 @@ def test_cc_prefers_correct_matrix():
     identity = np.eye(2, 3, dtype=np.float32)
     assert compute_alignment_cc(ref, src, M) > 0.9
     assert compute_alignment_cc(ref, src, M) > compute_alignment_cc(ref, src, identity)
+
+
+def test_seed_correspondences_round_trip():
+    theta = np.deg2rad(5)
+    M = np.array([[np.cos(theta), -np.sin(theta), 8.0],
+                  [np.sin(theta), np.cos(theta), -4.0]], np.float32)
+    ref_pts, src_pts = seed_correspondences_from_matrix(M, height=200, width=200)
+    assert len(ref_pts) == 6 and len(src_pts) == 6
+    est = estimate_affine_from_correspondences(np.array(ref_pts), np.array(src_pts))
+    assert np.abs(est - M).max() < 1e-3
+
+
+def test_seed_correspondences_n_points_clamped():
+    M = np.eye(2, 3, dtype=np.float32)
+    ref3, src3 = seed_correspondences_from_matrix(M, 100, 100, n_points=3)
+    ref8, src8 = seed_correspondences_from_matrix(M, 100, 100, n_points=8)
+    assert len(ref3) == 3 and len(src3) == 3
+    assert len(ref8) == 8 and len(src8) == 8
+
+
+def test_nudge_affine_translation():
+    M = np.eye(2, 3, dtype=np.float32)
+    nudged = nudge_affine_matrix(M, dx=10.0, dy=-5.0)
+    # Overlay content moves +dx,+dy → WARP_INVERSE translation becomes -dx,-dy.
+    assert abs(nudged[0, 2] - (-10.0)) < 1e-5
+    assert abs(nudged[1, 2] - 5.0) < 1e-5
+
+
+def test_filter_correspondences_by_residual():
+    M = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -3.0]], np.float32)
+    ref = np.array([[10, 10], [50, 20], [80, 90], [30, 70]], np.float32)
+    src = (M @ np.hstack([ref, np.ones((4, 1))]).T).T.astype(np.float32)
+    src[3] += np.array([40.0, 40.0], np.float32)  # outlier
+    resid = correspondence_residuals(ref, src, M)
+    assert resid[3] > 20
+    ref_in, src_in, keep = filter_correspondences_by_residual(ref, src, M, max_residual=5.0)
+    assert keep.sum() == 3
+    assert ref_in.shape[0] == 3
+
+
+def test_extract_feature_correspondences_on_shifted_image():
+    ref = _structured_image(256)
+    M = np.array([[1.0, 0.0, 12.0], [0.0, 1.0, -8.0]], np.float32)
+    src = _make_source(ref, M)
+    extracted = extract_feature_correspondences(ref, src)
+    assert extracted is not None
+    ref_pts, src_pts = extracted
+    assert ref_pts.shape[0] >= 3
+    resid = correspondence_residuals(ref_pts, src_pts, M)
+    # Most true matches should fit the known transform tightly.
+    assert np.median(resid) < 3.0

@@ -1,8 +1,7 @@
 """
 Headless smoke test for the manual corresponding-point view. It cannot render a
-real window, so it uses a fake page (no-op update) and synthesizes tap events to
-drive the actual handler code paths: select a capture, place matched points,
-compute a preview, accept, and finalize.
+real window, so it uses a fake page (no-op update) and synthesizes tap / pan
+events to drive the actual handler code paths.
 """
 import os
 import types
@@ -50,12 +49,15 @@ def test_manual_view_full_interaction(tmp_path):
     _write_visit(str(visit))
     plan = prepare_visit(str(visit))
 
-    fake_page = types.SimpleNamespace(update=lambda: None)
+    fake_page = types.SimpleNamespace(
+        update=lambda: None, width=1280, on_resize=None, window=None,
+    )
     captured = {}
 
-    def on_finalize(overrides_by_visit, points_by_visit):
+    def on_finalize(overrides_by_visit, points_by_visit, excluded_by_visit=None):
         captured["overrides"] = overrides_by_visit
         captured["points"] = points_by_visit
+        captured["excluded"] = excluded_by_visit or {}
 
     view = create_manual_align_view(
         fake_page, [plan], on_back=lambda: captured.setdefault("back", True),
@@ -66,26 +68,33 @@ def test_manual_view_full_interaction(tmp_path):
     gestures = [n for n in nodes if isinstance(n, ft.GestureDetector)]
     assert len(gestures) == 2, "expected reference + source pickers"
     ref_gd, src_gd = gestures
+    assert ref_gd.on_pan_start and ref_gd.on_pan_update and ref_gd.on_pan_end
 
-    # Buttons keyed by their label (stored in `content` as a plain string).
     buttons = {getattr(n, "content", None): n for n in nodes
                if isinstance(n, (ft.FilledButton, ft.OutlinedButton, ft.FilledTonalButton))}
     assert "Compute & Preview" in buttons
     assert "Accept" in buttons
     assert "Finalize & Save" in buttons
+    assert "Clear points" in buttons
+    assert "Delete selected" in buttons
+    assert "Drop outliers & refit" in buttons
 
-    # Capture list rows (Containers with an on_click selecting a capture).
     capture_rows = [n for n in nodes
                     if isinstance(n, ft.Container) and getattr(n, "on_click", None) is not None]
-    assert capture_rows, "no selectable captures"
-    # Rows correspond to capture indices 1..N (anchor capture 0 is excluded);
-    # selecting the first row edits capture index 1.
-    capture_rows[0].on_click(None)
+    assert len(capture_rows) >= 2
+    capture_rows[1].on_click(None)
 
-    # Place three matching landmark pairs (display coordinates).
+    # Nudge first, then Clear (must keep transform), then place pins.
+    assert "→" in buttons
+    buttons["→"].on_click(None)
+    buttons["Clear points"].on_click(None)
     for (x, y) in [(30, 30), (90, 70), (60, 100)]:
         ref_gd.on_tap_down(_tap(x, y))
         src_gd.on_tap_down(_tap(x + 2, y - 1))
+
+    ref_gd.on_pan_start(_tap(30, 30))
+    ref_gd.on_pan_update(_tap(40, 35))
+    ref_gd.on_pan_end(_tap(40, 35))
 
     buttons["Compute & Preview"].on_click(None)
     buttons["Accept"].on_click(None)
@@ -93,10 +102,12 @@ def test_manual_view_full_interaction(tmp_path):
 
     assert "overrides" in captured
     ov = captured["overrides"]
-    # Exactly one visit with one corrected capture (index 1).
     assert list(ov.keys()) == [plan.visit_name]
     assert 1 in ov[plan.visit_name]
     mat = ov[plan.visit_name][1]
     assert np.asarray(mat).shape == (2, 3)
-    # Points for the corrected capture were recorded.
     assert 1 in captured["points"][plan.visit_name]
+    pts = captured["points"][plan.visit_name][1]
+    assert len(pts["ref"]) == 3 and len(pts["src"]) == 3
+    # Drag moved pin #1 away from the original click location (display→full).
+    assert abs(pts["ref"][0][0] - pts["ref"][1][0]) > 1.0

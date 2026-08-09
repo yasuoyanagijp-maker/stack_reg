@@ -69,7 +69,32 @@ def make_overlay(reference: np.ndarray, source: np.ndarray, matrix: np.ndarray) 
     return overlay
 
 
-def draw_landmarks(img: np.ndarray, points: List[List[float]], color=(0, 255, 255)) -> np.ndarray:
+def nearest_landmark_index(
+    points: List[List[float]],
+    x: float,
+    y: float,
+    max_dist: float,
+) -> Optional[int]:
+    """Return index of the landmark nearest to ``(x, y)``, or ``None`` if none within ``max_dist``."""
+    if not points:
+        return None
+    best_i, best_d2 = None, float(max_dist) ** 2
+    for i, pt in enumerate(points):
+        dx = float(pt[0]) - float(x)
+        dy = float(pt[1]) - float(y)
+        d2 = dx * dx + dy * dy
+        if d2 <= best_d2:
+            best_d2 = d2
+            best_i = i
+    return best_i
+
+
+def draw_landmarks(
+    img: np.ndarray,
+    points: List[List[float]],
+    color=(0, 255, 255),
+    selected_idx: Optional[int] = None,
+) -> np.ndarray:
     """Return a BGR copy of ``img`` with numbered landmark markers drawn on it."""
     if img.ndim == 2:
         canvas = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
@@ -78,10 +103,47 @@ def draw_landmarks(img: np.ndarray, points: List[List[float]], color=(0, 255, 25
     r = max(4, int(round(max(img.shape[:2]) * 0.006)))
     for i, (x, y) in enumerate(points):
         c = (int(round(x)), int(round(y)))
-        cv2.circle(canvas, c, r, color, 2)
+        if selected_idx is not None and i == selected_idx:
+            cv2.circle(canvas, c, r + 4, (255, 255, 0), 2)  # cyan (BGR) highlight
+            cv2.circle(canvas, c, r, color, 3)
+        else:
+            cv2.circle(canvas, c, r, color, 2)
         cv2.circle(canvas, c, 1, color, -1)
         cv2.putText(canvas, str(i + 1), (c[0] + r + 2, c[1] - r),
                     cv2.FONT_HERSHEY_SIMPLEX, max(0.4, r * 0.12), color, 2, cv2.LINE_AA)
+    return canvas
+
+
+def draw_diagnostic_matches(
+    img: np.ndarray,
+    points: np.ndarray,
+    inlier_mask: np.ndarray,
+    *,
+    max_draw: int = 200,
+) -> np.ndarray:
+    """
+    Draw automatic feature matches as small dots: green = inlier, red = outlier.
+    Caps drawing at ``max_draw`` for readability (subsamples evenly).
+    """
+    if img.ndim == 2:
+        canvas = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    else:
+        canvas = img.copy()
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    mask = np.asarray(inlier_mask, dtype=bool).reshape(-1)
+    if pts.shape[0] == 0:
+        return canvas
+    if pts.shape[0] != mask.shape[0]:
+        raise ValueError("points and inlier_mask length mismatch")
+    n = pts.shape[0]
+    if n > max_draw:
+        idx = np.linspace(0, n - 1, max_draw).astype(int)
+        pts = pts[idx]
+        mask = mask[idx]
+    r = max(2, int(round(max(img.shape[:2]) * 0.003)))
+    for (x, y), ok in zip(pts, mask):
+        color = (0, 220, 0) if ok else (40, 40, 220)  # BGR: green / red
+        cv2.circle(canvas, (int(round(x)), int(round(y))), r, color, -1, cv2.LINE_AA)
     return canvas
 
 
