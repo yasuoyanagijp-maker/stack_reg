@@ -5,9 +5,9 @@ async def main(page: ft.Page):
     # 1. Native Window Configuration (Premium Feel)
     page.title = "ARIAKE OCTA Stack Registration"
     page.theme_mode = ft.ThemeMode.DARK
-    page.window.width = 1100
-    page.window.height = 800
-    page.window.min_width = 800
+    page.window.width = 1280
+    page.window.height = 840
+    page.window.min_width = 900
     page.window.min_height = 600
     
     # Custom Theme with modern color palette

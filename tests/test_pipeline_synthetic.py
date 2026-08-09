@@ -94,9 +94,16 @@ def test_matrix_override_changes_output(tmp_path):
     bad[0, 2] += 200.0
     out_over = tmp_path / "over"
     out_over.mkdir()
-    # source_layer=0 means params came from image1; they must still rewrite all layers.
+    orig_m12 = float(plan.matrices[1][0, 2])
+    # source_layer=0: params came from image1; applied to all layers of this Visit.
     finalize_visit(
-        plan, "P", str(out_over), matrix_overrides={1: bad}, source_layer=0
+        plan,
+        "P",
+        str(out_over),
+        matrix_overrides={1: bad},
+        source_layer=0,
+        target_layers=None,
+        persist_overrides=True,
     )
 
     auto_files = sorted(f for f in os.listdir(out_auto) if f.endswith(".tif"))
@@ -112,8 +119,53 @@ def test_matrix_override_changes_output(tmp_path):
         assert a.shape == b.shape
         assert not np.array_equal(a, b), f"override should alter {fname}"
 
-    # The plan's original matrices must be untouched by the override.
-    assert plan.matrices[1][0, 2] != bad[0, 2]
+    # Accepted override is persisted onto the plan for subsequent rounds.
+    assert plan.matrices[1][0, 2] == bad[0, 2]
+    assert plan.matrices[1][0, 2] != orig_m12
+
+
+def test_finalize_excluded_capture_changes_average(tmp_path):
+    visit = tmp_path / "visit"
+    _write_synthetic_visit(str(visit), n_captures=3, n_layers=2)
+    plan = prepare_visit(str(visit))
+    out_all = tmp_path / "all"
+    out_all.mkdir()
+    finalize_visit(plan, "P", str(out_all), target_layers=[0])
+
+    out_ex = tmp_path / "ex"
+    out_ex.mkdir()
+    finalize_visit(
+        plan, "P", str(out_ex), target_layers=[0], excluded_captures=[2]
+    )
+    f_all = next(f for f in os.listdir(out_all) if f.endswith("image1.tif"))
+    f_ex = next(f for f in os.listdir(out_ex) if f.endswith("image1.tif"))
+    a = cv2.imread(os.path.join(out_all, f_all), cv2.IMREAD_GRAYSCALE)
+    b = cv2.imread(os.path.join(out_ex, f_ex), cv2.IMREAD_GRAYSCALE)
+    assert a is not None and b is not None
+    assert not np.array_equal(a, b)
+
+
+def test_finalize_can_exclude_reference_capture(tmp_path):
+    """Capture 1 (index 0 / reference) may also be omitted from the average."""
+    visit = tmp_path / "visit"
+    _write_synthetic_visit(str(visit), n_captures=3, n_layers=2)
+    plan = prepare_visit(str(visit))
+    out_all = tmp_path / "all"
+    out_all.mkdir()
+    finalize_visit(plan, "P", str(out_all), target_layers=[0])
+
+    out_ex = tmp_path / "ex0"
+    out_ex.mkdir()
+    ok = finalize_visit(
+        plan, "P", str(out_ex), target_layers=[0], excluded_captures=[0]
+    )
+    assert ok
+    f_all = next(f for f in os.listdir(out_all) if f.endswith("image1.tif"))
+    f_ex = next(f for f in os.listdir(out_ex) if f.endswith("image1.tif"))
+    a = cv2.imread(os.path.join(out_all, f_all), cv2.IMREAD_GRAYSCALE)
+    b = cv2.imread(os.path.join(out_ex, f_ex), cv2.IMREAD_GRAYSCALE)
+    assert a is not None and b is not None
+    assert not np.array_equal(a, b)
 
 
 def test_run_pipeline_end_to_end_with_overrides(tmp_path):

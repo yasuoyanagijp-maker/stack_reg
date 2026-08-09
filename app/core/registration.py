@@ -319,6 +319,110 @@ def compute_alignment_cc(
     return float(np.clip((a * b).sum() / denom, -1.0, 1.0))
 
 
+def extract_feature_correspondences(
+    reference: np.ndarray,
+    source: np.ndarray,
+    max_features: int = 2000,
+    ratio: float = 0.75,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """
+    ORB + Lowe-ratio matches between ``reference`` and ``source``.
+
+    Returns ``(ref_pts, src_pts)`` as float32 ``(N, 2)`` arrays, or ``None``
+    when fewer than 3 putative matches are found. Used for diagnostic display
+    and residual-based outlier rejection in the manual editor.
+    """
+    ref = reference.astype(np.uint8)
+    src = source.astype(np.uint8)
+    orb = cv2.ORB_create(nfeatures=max_features)
+    kp_ref, des_ref = orb.detectAndCompute(ref, None)
+    kp_src, des_src = orb.detectAndCompute(src, None)
+    if des_ref is None or des_src is None or len(kp_ref) < 3 or len(kp_src) < 3:
+        return None
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    knn = matcher.knnMatch(des_ref, des_src, k=2)
+    good = [
+        pair[0]
+        for pair in knn
+        if len(pair) == 2 and pair[0].distance < ratio * pair[1].distance
+    ]
+    if len(good) < 3:
+        return None
+    ref_pts = np.float32([kp_ref[m.queryIdx].pt for m in good])
+    src_pts = np.float32([kp_src[m.trainIdx].pt for m in good])
+    return ref_pts, src_pts
+
+
+def correspondence_residuals(
+    ref_pts: np.ndarray,
+    src_pts: np.ndarray,
+    matrix: np.ndarray,
+) -> np.ndarray:
+    """
+    Per-match residual (px) of ``matrix`` mapping ref→src (WARP_INVERSE_MAP).
+    """
+    ref = np.asarray(ref_pts, dtype=np.float64).reshape(-1, 2)
+    src = np.asarray(src_pts, dtype=np.float64).reshape(-1, 2)
+    m = np.asarray(matrix, dtype=np.float64).reshape(2, 3)
+    ones = np.ones((ref.shape[0], 1), dtype=np.float64)
+    pred = (m @ np.hstack([ref, ones]).T).T
+    return np.linalg.norm(pred - src, axis=1).astype(np.float64)
+
+
+def filter_correspondences_by_residual(
+    ref_pts: np.ndarray,
+    src_pts: np.ndarray,
+    matrix: np.ndarray,
+    max_residual: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Keep matches whose residual under ``matrix`` is ≤ ``max_residual``.
+
+    Returns ``(ref_in, src_in, keep_mask)``.
+    """
+    resid = correspondence_residuals(ref_pts, src_pts, matrix)
+    keep = resid <= float(max_residual)
+    return (
+        np.asarray(ref_pts, dtype=np.float32)[keep],
+        np.asarray(src_pts, dtype=np.float32)[keep],
+        keep,
+    )
+
+
+def nudge_affine_matrix(
+    matrix: np.ndarray,
+    dx: float = 0.0,
+    dy: float = 0.0,
+    dtheta_deg: float = 0.0,
+    center: Optional[Tuple[float, float]] = None,
+) -> np.ndarray:
+    """
+    Nudge a ref→src affine so the *warped overlay* moves by ``(dx, dy)`` pixels
+    and rotates by ``dtheta_deg`` (CCW) about ``center`` in the reference frame.
+
+    Positive ``dx`` moves the magenta (warped source) to the right on the overlay.
+    """
+    m = np.asarray(matrix, dtype=np.float64).reshape(2, 3)
+    m3 = np.vstack([m, [0.0, 0.0, 1.0]])
+    # Shift content by (dx, dy) in destination (reference) space:
+    # dst(x,y) should sample what was previously at (x-dx, y-dy).
+    t = np.array(
+        [[1.0, 0.0, -float(dx)], [0.0, 1.0, -float(dy)], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    m3 = m3 @ t
+    if abs(dtheta_deg) > 1e-9:
+        cx, cy = center if center is not None else (0.0, 0.0)
+        th = np.deg2rad(float(dtheta_deg))
+        c, s = np.cos(th), np.sin(th)
+        # Rotate content CCW about center in destination space.
+        to_c = np.array([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], dtype=np.float64)
+        rot = np.array([[c, s, 0], [-s, c, 0], [0, 0, 1]], dtype=np.float64)  # inverse of CCW
+        from_c = np.array([[1, 0, cx], [0, 1, cy], [0, 0, 1]], dtype=np.float64)
+        m3 = m3 @ from_c @ rot @ to_c
+    return m3[:2, :].astype(np.float32)
+
+
 def refine_affine_feature_based(
     reference: np.ndarray,
     source: np.ndarray,
@@ -348,24 +452,12 @@ def refine_affine_feature_based(
         ``(matrix, cc)`` where ``cc`` is ``compute_alignment_cc`` of the estimate,
         or ``None`` when too few reliable correspondences are found.
     """
-    ref = reference.astype(np.uint8)
-    src = source.astype(np.uint8)
-
-    orb = cv2.ORB_create(nfeatures=max_features)
-    kp_ref, des_ref = orb.detectAndCompute(ref, None)
-    kp_src, des_src = orb.detectAndCompute(src, None)
-    if des_ref is None or des_src is None or len(kp_ref) < 3 or len(kp_src) < 3:
+    extracted = extract_feature_correspondences(
+        reference, source, max_features=max_features, ratio=ratio
+    )
+    if extracted is None:
         return None
-
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
-    knn = matcher.knnMatch(des_ref, des_src, k=2)
-    good = [pair[0] for pair in knn
-            if len(pair) == 2 and pair[0].distance < ratio * pair[1].distance]
-    if len(good) < 3:
-        return None
-
-    ref_pts = np.float32([kp_ref[m.queryIdx].pt for m in good])
-    src_pts = np.float32([kp_src[m.trainIdx].pt for m in good])
+    ref_pts, src_pts = extracted
 
     if full_affine:
         matrix, _ = cv2.estimateAffine2D(
@@ -383,10 +475,64 @@ def refine_affine_feature_based(
     return matrix, cc
 
 
-def average_project_stack(stack: np.ndarray) -> np.ndarray:
+def average_project_stack(
+    stack: np.ndarray,
+    include_indices: Optional[List[int]] = None,
+) -> np.ndarray:
     """
     Computes the Average Intensity Projection of a stack.
     
     In ImageJ: run("Z Project...", "projection=[Average Intensity]");
+
+    ``include_indices`` optionally limits which slices contribute to the mean
+    (used when poor-quality captures are excluded from averaging).
     """
-    return np.mean(stack, axis=0).astype(np.uint8)
+    if include_indices is None:
+        return np.mean(stack, axis=0).astype(np.uint8)
+    if not include_indices:
+        raise ValueError("At least one capture must remain for averaging.")
+    return np.mean(stack[np.asarray(include_indices, dtype=int)], axis=0).astype(np.uint8)
+
+
+def seed_correspondences_from_matrix(
+    matrix: np.ndarray,
+    height: int,
+    width: int,
+    margin: float = 0.22,
+    n_points: int = 6,
+) -> Tuple[List[List[float]], List[List[float]]]:
+    """
+    Build editable corresponding-point pairs that reproduce an existing affine
+    ``matrix`` (ref→src / WARP_INVERSE_MAP convention).
+
+    Places ``n_points`` (default 6, clamped to 3–8) landmarks on a coarse grid
+    inside the image, then maps each through ``matrix`` onto the source. These
+    are pin landmarks for manual fine-tuning — not the full ORB match set.
+    """
+    m = np.asarray(matrix, dtype=np.float64).reshape(2, 3)
+    mx = float(np.clip(margin, 0.05, 0.4))
+    n = int(np.clip(n_points, 3, 8))
+    # Prefer a 2×3 grid (6 pts); fall back to triangle for n==3.
+    if n <= 3:
+        xs = [width * mx, width * (1.0 - mx), width * 0.5]
+        ys = [height * mx, height * mx, height * (1.0 - mx)]
+        ref = [[xs[i], ys[i]] for i in range(3)]
+    else:
+        cols = 3 if n >= 6 else 2
+        rows = 2 if n <= 6 else 3
+        xs = np.linspace(width * mx, width * (1.0 - mx), cols)
+        ys = np.linspace(height * mx, height * (1.0 - mx), rows)
+        ref = []
+        for y in ys:
+            for x in xs:
+                ref.append([float(x), float(y)])
+                if len(ref) >= n:
+                    break
+            if len(ref) >= n:
+                break
+    src: List[List[float]] = []
+    for x, y in ref:
+        sx = m[0, 0] * x + m[0, 1] * y + m[0, 2]
+        sy = m[1, 0] * x + m[1, 1] * y + m[1, 2]
+        src.append([float(sx), float(sy)])
+    return ref, src

@@ -371,18 +371,18 @@ def create_dashboard(page: ft.Page, mount_view=None):
                     pass
                 return
 
-        # Prefer the visit matching the reviewed result file.
+        # Edit only the visit matching the reviewed result (do not touch other visits).
         if visit_name:
             preferred = [p for p in plans if p.visit_name == visit_name]
             if preferred:
-                plans = preferred + [p for p in plans if p.visit_name != visit_name]
+                plans = preferred
 
         review_state["focus_layer"] = focus_layer
         review_state["focus_visit"] = visit_name
         # Do not schedule_log here: journal is unmounted on the results screen.
         page.run_task(open_manual_view, plans, focus_layer)
 
-    def handle_finalize(overrides_by_visit, points_by_visit):
+    def handle_finalize(overrides_by_visit, points_by_visit, excluded_by_visit=None):
         plans = review_state["plans"]
         if not plans:
             return
@@ -391,14 +391,18 @@ def create_dashboard(page: ft.Page, mount_view=None):
         input_dir = input_path.value
         output_dir = output_path.value
         focus_layer = review_state.get("focus_layer")
+        focus_visit = review_state.get("focus_visit")
+        excluded_by_visit = excluded_by_visit or {}
         _last_progress_ts[0] = 0.0
         go_dashboard()
         focus_label = (
             f"image{focus_layer + 1}" if focus_layer is not None else "manual points"
         )
+        # Same Visit: rewrite all result images (image1–N) with these capture matrices.
+        # Other Visits are never re-finalized here.
         schedule_log(
             f"--- Finalizing: applying {focus_label} registration params "
-            "to all result images ---"
+            "to all result images of this Visit only (other Visits untouched) ---"
         )
 
         def work():
@@ -410,10 +414,25 @@ def create_dashboard(page: ft.Page, mount_view=None):
                 os.makedirs(patient_output_dir, exist_ok=True)
                 review_state["patient_output_dir"] = patient_output_dir
 
-                total = len(plans)
+                # Only the Visit being edited — never re-synthesize sibling Visits.
+                edited_names = set(overrides_by_visit or {}) | set(excluded_by_visit or {})
+                if focus_visit:
+                    plans_to_run = [p for p in plans if p.visit_name == focus_visit]
+                elif edited_names:
+                    plans_to_run = [p for p in plans if p.visit_name in edited_names]
+                else:
+                    plans_to_run = list(plans)[:1]
+
+                if not plans_to_run:
+                    schedule_log("ERROR: No Visit selected to finalize.", color=ft.Colors.RED_400)
+                    page.run_task(ui_complete, False, False)
+                    return
+
+                total = len(plans_to_run)
                 with contextlib.redirect_stdout(JournalRedirector()):
-                    for v_idx, plan in enumerate(plans):
-                        ov = overrides_by_visit.get(plan.visit_name)
+                    for v_idx, plan in enumerate(plans_to_run):
+                        ov = (overrides_by_visit or {}).get(plan.visit_name)
+                        excl = (excluded_by_visit or {}).get(plan.visit_name)
 
                         def fin_cb(val, status, _b=v_idx, _t=total):
                             schedule_progress((_b + val) / _t, status)
@@ -426,6 +445,9 @@ def create_dashboard(page: ft.Page, mount_view=None):
                             automate_tuning=auto_tuning_val,
                             matrix_overrides=ov,
                             source_layer=focus_layer,
+                            target_layers=None,  # all layers of this Visit
+                            excluded_captures=excl,
+                            persist_overrides=True,
                             progress_callback=fin_cb,
                             log_callback=schedule_log,
                         )
@@ -435,13 +457,19 @@ def create_dashboard(page: ft.Page, mount_view=None):
                     else:
                         success = True
                         schedule_log(
-                            f"Saved corrected stack images to {patient_output_dir}."
+                            f"Saved all layers for "
+                            f"{', '.join(p.visit_name for p in plans_to_run)} "
+                            f"→ {patient_output_dir}."
                         )
             except Exception as exc:
                 schedule_log(f"ERROR: {exc}", color=ft.Colors.RED_400)
             corrections = {
                 v: sorted(d.keys()) for v, d in (overrides_by_visit or {}).items() if d
             }
+            for v, caps in (excluded_by_visit or {}).items():
+                if caps:
+                    corrections.setdefault(v, [])
+                    # mark exclusions distinctly in summary via negative? keep separate later
             review_state["last_corrections"] = corrections if success else None
             page.run_task(ui_complete, success, True)
 

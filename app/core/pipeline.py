@@ -244,24 +244,30 @@ def finalize_visit(
     automate_tuning: bool = True,
     matrix_overrides: Optional[Dict[int, np.ndarray]] = None,
     source_layer: Optional[int] = None,
+    target_layers: Optional[List[int]] = None,
+    excluded_captures: Optional[List[int]] = None,
+    persist_overrides: bool = True,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """
     Phase 2 for a single Visit: apply the (optionally manually corrected) capture
-    matrices to every layer (still via the 4× enlarge path), enhance with CLAHE,
-    average-project and save.
+    matrices, enhance with CLAHE, average-project and save.
 
     ``matrix_overrides`` maps a capture index to a replacement 2x3 matrix (as
     produced by ``estimate_affine_from_correspondences``); these take precedence
     over the automatic alignment for the affected captures.
 
-    The same per-capture matrices are applied to **all** layers (image1…imageN).
-    When the user corrected landmarks on one selected result image, pass that
-    0-based index as ``source_layer`` so the journal records which image the
-    parameters came from; the transforms still rewrite every output image.
+    ``target_layers`` (0-based) limits which result images are rewritten. When
+    the user edits from Review & Correct for ``imageN``, pass ``[N-1]`` so other
+    images are left untouched. ``None`` means all layers (initial Run Registration).
 
-    ``progress_callback`` receives values in ``0.0..1.0`` scoped to this phase.
+    ``excluded_captures`` (0-based capture indices, including the reference
+    capture 0 if desired) are omitted from the average. At least one capture
+    must remain.
+
+    When ``persist_overrides`` is True, accepted matrices are written back into
+    ``plan.matrices`` so a second correction round starts from the new baseline.
     """
     progress = progress_callback or _noop_progress
     log = log_callback or _noop_log
@@ -270,7 +276,7 @@ def finalize_visit(
     folder_contents = plan.folder_contents
     sorted_captures = plan.sorted_captures
 
-    # Apply manual overrides without mutating the plan's original matrices.
+    # Apply manual overrides without mutating until persist step below.
     matrices = [m.copy() for m in plan.matrices]
     if matrix_overrides:
         for idx, mat in matrix_overrides.items():
@@ -281,21 +287,36 @@ def finalize_visit(
     total_captures = len(sorted_captures)
     total_layers = len(folder_contents[sorted_captures[0]])
 
-    if matrix_overrides:
+    if target_layers is None:
+        layers_to_process = list(range(total_layers))
+    else:
+        layers_to_process = sorted({int(i) for i in target_layers if 0 <= int(i) < total_layers})
+        if not layers_to_process:
+            log("ERROR: No valid target layers to finalize.")
+            return False
+
+    excluded = {int(i) for i in (excluded_captures or []) if 0 <= int(i) < total_captures}
+    include_indices = [i for i in range(total_captures) if i not in excluded]
+    if not include_indices:
+        log("ERROR: All captures excluded; nothing left to average.")
+        return False
+    if excluded:
+        excl_h = ", ".join(str(i + 1) for i in sorted(excluded))
+        log(f"  [EXCLUDE] Captures omitted from average: {excl_h}")
+
+    if matrix_overrides or excluded:
         src = (
             f"image{source_layer + 1}"
             if source_layer is not None
             else "manual corresponding points"
         )
-        all_imgs = ", ".join(f"image{i + 1}" for i in range(total_layers))
-        log(
-            f"  [MANUAL] Parameters from {src} will be applied to all layers "
-            f"({all_imgs})."
-        )
+        tgt = ", ".join(f"image{i + 1}" for i in layers_to_process)
+        log(f"  [MANUAL] Parameters from {src} applied only to: {tgt}.")
 
-    for layer_idx in range(total_layers):
-        layer_weight = 1.0 / total_layers
-        layer_base = layer_idx * layer_weight
+    n_layers_work = len(layers_to_process)
+    for work_i, layer_idx in enumerate(layers_to_process):
+        layer_weight = 1.0 / n_layers_work
+        layer_base = work_i * layer_weight
 
         log(f"  Processing Layer {layer_idx+1}/{total_layers}...")
         log(f"    Loading {total_captures} captures (4x enlarge)...")
@@ -321,7 +342,6 @@ def finalize_visit(
         def layer_warp_cb(inner_val, inner_status):
             progress(layer_base + (inner_val * 0.5 * layer_weight), f"[{visit_name}] L{layer_idx+1}: {inner_status}")
 
-        # Same matrices for every layer — manual params from one image apply to all.
         registered_stack = apply_transformations_to_stack(stack_array, matrices, progress_callback=layer_warp_cb)
         log(f"    Warp complete.")
 
@@ -347,12 +367,17 @@ def finalize_visit(
             log(f"    Skipping CLAHE for Layer 1 (reference layer).")
 
         progress(layer_base + 0.9 * layer_weight, f"[{visit_name}] L{layer_idx+1}: Averaging...")
-        avg_img = average_project_stack(registered_stack)
+        avg_img = average_project_stack(registered_stack, include_indices=include_indices)
 
         output_filename = f"{patient_name}-Avg-Stack_{visit_name}_image{layer_idx+1}.tif"
         output_filepath = os.path.join(patient_output_dir, output_filename)
         tifffile.imwrite(output_filepath, avg_img)
         log(f"    Saved: {output_filename}")
+
+    if persist_overrides and matrix_overrides:
+        for idx, mat in matrix_overrides.items():
+            if 0 <= idx < len(plan.matrices):
+                plan.matrices[idx] = np.asarray(mat, dtype=np.float32).copy()
 
     progress(1.0, f"[{visit_name}] Done.")
     return True
