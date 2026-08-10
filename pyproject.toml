@@ -23,4 +23,4 @@ product = "ARIAKE OCTA Stack Registration"
 
 [tool.flet.app]
 module = "main"
-exclude = ["venv", "archive", ".git", "build", "ARIAKE_Stack_Reg_J.ijm"]
+exclude = ["venv", "archive", ".git", "build", "dist", "import_out.txt", "pytest_out.txt", ".pytest_cache", "ARIAKE_Stack_Reg_J.ijm"]
