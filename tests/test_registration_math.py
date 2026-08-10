@@ -10,6 +10,9 @@ from app.core.registration import (
     correspondence_residuals,
     filter_correspondences_by_residual,
     nudge_affine_matrix,
+    invert_affine_2x3,
+    compose_affine_2x3,
+    rebase_affine_matrices,
 )
 
 
@@ -125,3 +128,64 @@ def test_extract_feature_correspondences_on_shifted_image():
     resid = correspondence_residuals(ref_pts, src_pts, M)
     # Most true matches should fit the known transform tightly.
     assert np.median(resid) < 3.0
+
+
+def test_rebase_affine_matrices_new_reference_is_identity():
+    mats = [
+        np.eye(2, 3, dtype=np.float32),
+        np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -2.0]], np.float32),
+        np.array([[1.0, 0.0, -3.0], [0.0, 1.0, 4.0]], np.float32),
+    ]
+    rebased = rebase_affine_matrices(mats, 2)
+    assert np.allclose(rebased[2], np.eye(2, 3), atol=1e-5)
+    # Round-trip: rebasing back to 0 restores original (within float error).
+    restored = rebase_affine_matrices(rebased, 0)
+    for a, b in zip(mats, restored):
+        assert np.allclose(a, b, atol=1e-4)
+
+
+def test_rebase_preserves_point_mapping():
+    """M'_i @ p_new_ref == M_i @ p_old_ref when p_new = M_new @ p_old."""
+    mats = [
+        np.eye(2, 3, dtype=np.float32),
+        np.array([[0.98, -0.05, 4.0], [0.05, 0.98, -3.0]], np.float32),
+        np.array([[1.0, 0.02, -6.0], [-0.02, 1.0, 5.0]], np.float32),
+    ]
+    new_ref = 1
+    rebased = rebase_affine_matrices(mats, new_ref)
+    p_old = np.array([40.0, 55.0, 1.0], np.float64)
+    M_new = np.vstack([mats[new_ref], [0, 0, 1]])
+    p_new = M_new @ p_old
+    for i in range(len(mats)):
+        Mi = np.vstack([mats[i], [0, 0, 1]])
+        Mi2 = np.vstack([rebased[i], [0, 0, 1]])
+        assert np.allclose(Mi @ p_old, Mi2 @ p_new, atol=1e-4)
+
+
+def test_compose_invert_roundtrip():
+    M = np.array([[0.97, -0.1, 8.0], [0.1, 0.97, -4.0]], np.float32)
+    assert np.allclose(
+        compose_affine_2x3(M, invert_affine_2x3(M)),
+        np.eye(2, 3),
+        atol=1e-5,
+    )
+
+
+def test_calculate_affine_with_non_zero_reference():
+    from app.core.registration import calculate_affine_transformations
+
+    ref = _structured_image(128)
+    stack = np.stack([
+        _make_source(ref, np.array([[1, 0, 5], [0, 1, -3]], np.float32)),
+        ref,
+        _make_source(ref, np.array([[1, 0, -4], [0, 1, 6]], np.float32)),
+    ], axis=0)
+    mats, scores = calculate_affine_transformations(
+        stack, return_scores=True, reference_idx=1
+    )
+    assert np.allclose(mats[1], np.eye(2, 3), atol=1e-5)
+    assert scores[1] == 1.0
+    assert len(mats) == 3
+    # Other captures should have a usable confidence after alignment.
+    assert scores[0] > 0.5 and scores[2] > 0.5
+
