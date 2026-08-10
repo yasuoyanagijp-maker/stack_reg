@@ -31,7 +31,10 @@ def create_dashboard(page: ft.Page, mount_view=None):
     progress_text = ft.Text("Ready", size=14, color=ft.Colors.CYAN_200)
     log_messages = ft.ListView(expand=True, spacing=5, padding=10, auto_scroll=True)
 
-    # Session state shared across run → review → manual → finalize
+    # Session state shared across run → review → manual → finalize.
+    # ``plans`` always holds the full VisitPlan list from the last Run Registration.
+    # Manual opens may filter to one visit for editing — never overwrite ``plans``
+    # with that filtered list (second Review & Correct needs the full session).
     review_state = {
         "plans": [],
         "patient_output_dir": None,
@@ -39,6 +42,8 @@ def create_dashboard(page: ft.Page, mount_view=None):
         "focus_visit": None,
         "last_corrections": None,
     }
+    # Bumps on each manual navigation so a slower preload cannot mount a stale view.
+    _manual_nav_gen = [0]
 
     # --- File Pickers (v0.84: Service, not visual control) ---
     input_picker = ft.FilePicker()
@@ -263,16 +268,21 @@ def create_dashboard(page: ft.Page, mount_view=None):
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
-    async def open_manual_view(plans, focus_layer):
+    async def open_manual_view(edit_plans, focus_layer):
         """
-        Navigate to the manual editor.
+        Navigate to the manual editor for ``edit_plans`` / ``focus_layer``.
 
         Important: the dashboard (and its journal ListView) is unmounted while
         the results screen is showing. Do **not** call log_messages.update()
         here — that used to abort navigation silently on Flet 0.84.
+
+        Does **not** replace ``review_state["plans"]`` with the (possibly
+        single-visit) ``edit_plans`` list — that caused the second Review &
+        Correct to lose visits / reuse a stale focus context.
         """
-        review_state["plans"] = plans
         review_state["focus_layer"] = focus_layer
+        _manual_nav_gen[0] += 1
+        nav_token = _manual_nav_gen[0]
 
         if not mount_view:
             page.snack_bar = ft.SnackBar(
@@ -287,19 +297,21 @@ def create_dashboard(page: ft.Page, mount_view=None):
 
         def back_to_results():
             out = review_state.get("patient_output_dir")
+            # Use the current focus from session state (not a stale closure).
+            fl = review_state.get("focus_layer")
             if out and mount_view:
                 page.run_task(
                     show_results,
                     out,
                     review_state.get("last_corrections"),
-                    focus_layer + 1 if focus_layer is not None else None,
+                    fl + 1 if fl is not None else None,
                 )
             else:
                 go_dashboard()
 
         def preload():
             stacks = {}
-            for plan in plans:
+            for plan in edit_plans:
                 if focus_layer is not None:
                     stacks[plan.visit_name] = plan.load_layer_stack(focus_layer)
                 else:
@@ -308,26 +320,33 @@ def create_dashboard(page: ft.Page, mount_view=None):
 
         try:
             preloaded = await asyncio.to_thread(preload)
+            if nav_token != _manual_nav_gen[0]:
+                return  # a newer Review & Correct superseded this open
             view = create_manual_align_view(
                 page,
-                plans,
+                edit_plans,
                 on_back=back_to_results,
                 on_finalize=handle_finalize,
                 focus_layer=focus_layer,
                 preloaded_stacks=preloaded,
             )
+            if nav_token != _manual_nav_gen[0]:
+                return
             mount_view(view)
         except Exception as exc:
+            if nav_token != _manual_nav_gen[0]:
+                return
             page.snack_bar = ft.SnackBar(
                 ft.Text(f"Failed to open manual registration: {exc}")
             )
             page.snack_bar.open = True
             out = review_state.get("patient_output_dir")
+            fl = review_state.get("focus_layer")
             if out:
                 await show_results(
                     out,
                     review_state.get("last_corrections"),
-                    focus_layer + 1 if focus_layer is not None else None,
+                    fl + 1 if fl is not None else None,
                 )
             else:
                 go_dashboard()
@@ -339,8 +358,21 @@ def create_dashboard(page: ft.Page, mount_view=None):
         Does **not** re-run automatic slice alignment. Uses the VisitPlan(s)
         retained from the completed Run Registration.
         """
-        plans = list(review_state.get("plans") or [])
-        if not plans:
+        try:
+            image_num = int(image_num)
+        except (TypeError, ValueError):
+            page.snack_bar = ft.SnackBar(
+                ft.Text("Invalid result image selection.")
+            )
+            page.snack_bar.open = True
+            try:
+                page.update()
+            except Exception:
+                pass
+            return
+
+        session_plans = list(review_state.get("plans") or [])
+        if not session_plans:
             page.snack_bar = ft.SnackBar(
                 ft.Text(
                     "Session plans are missing. Run Registration again in this "
@@ -355,7 +387,7 @@ def create_dashboard(page: ft.Page, mount_view=None):
             return
 
         focus_layer = image_num - 1  # image1 → layer 0
-        for plan in plans:
+        for plan in session_plans:
             n_layers = len(plan.folder_contents[plan.sorted_captures[0]])
             if focus_layer < 0 or focus_layer >= n_layers:
                 page.snack_bar = ft.SnackBar(
@@ -372,15 +404,16 @@ def create_dashboard(page: ft.Page, mount_view=None):
                 return
 
         # Edit only the visit matching the reviewed result (do not touch other visits).
+        edit_plans = session_plans
         if visit_name:
-            preferred = [p for p in plans if p.visit_name == visit_name]
+            preferred = [p for p in session_plans if p.visit_name == visit_name]
             if preferred:
-                plans = preferred
+                edit_plans = preferred
 
         review_state["focus_layer"] = focus_layer
         review_state["focus_visit"] = visit_name
         # Do not schedule_log here: journal is unmounted on the results screen.
-        page.run_task(open_manual_view, plans, focus_layer)
+        page.run_task(open_manual_view, edit_plans, focus_layer)
 
     def handle_finalize(overrides_by_visit, points_by_visit, excluded_by_visit=None):
         plans = review_state["plans"]

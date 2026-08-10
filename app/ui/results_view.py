@@ -83,21 +83,16 @@ def create_results_view(
         "visit": None,
     }
 
-    visit_dd = ft.Dropdown(
-        label="Visit",
-        width=280,
-        options=[],
-        visible=False,
-    )
-    image_dd = ft.Dropdown(
-        label="Result image",
-        width=200,
-        options=[
-            ft.DropdownOption(key=str(n), text=f"image{n}")
-            for n in image_nums
-        ],
-        value=str(state["image_num"]) if state["image_num"] is not None else None,
-    )
+    def _dropdown_value(control, event=None):
+        """Prefer the live control value (and event payload) over stale state."""
+        for candidate in (
+            getattr(control, "value", None),
+            getattr(getattr(event, "control", None), "value", None),
+            getattr(event, "data", None),
+        ):
+            if candidate is not None and candidate != "":
+                return candidate
+        return None
 
     def _visits_for_image(image_num):
         return sorted(by_image.get(image_num, {}).keys())
@@ -155,23 +150,63 @@ def create_results_view(
             except Exception:
                 pass
 
-    def on_image_change(e):
-        if image_dd.value is None:
+    def on_image_change(e=None):
+        raw = _dropdown_value(image_dd, e)
+        if raw is None:
             return
-        state["image_num"] = int(image_dd.value)
+        state["image_num"] = int(raw)
+        image_dd.value = str(state["image_num"])
         state["visit"] = None
         refresh_preview()
 
-    def on_visit_change(e):
-        if visit_dd.value is None:
+    def on_visit_change(e=None):
+        raw = _dropdown_value(visit_dd, e)
+        if raw is None:
             return
-        state["visit"] = visit_dd.value
+        state["visit"] = str(raw)
+        visit_dd.value = state["visit"]
         refresh_preview()
 
-    image_dd.on_select = on_image_change
-    visit_dd.on_select = on_visit_change
+    visit_dd = ft.Dropdown(
+        label="Visit",
+        width=280,
+        options=[],
+        visible=False,
+        enable_search=False,
+        on_select=on_visit_change,
+    )
+    image_dd = ft.Dropdown(
+        label="Result image",
+        width=200,
+        options=[
+            ft.DropdownOption(key=str(n), text=f"image{n}")
+            for n in image_nums
+        ],
+        value=str(state["image_num"]) if state["image_num"] is not None else None,
+        enable_search=False,
+        on_select=on_image_change,
+    )
+
+    def _sync_selection_from_controls():
+        """
+        Re-read dropdown values at action time.
+
+        After returning from a first Review & Correct, Flet may keep the dropdown
+        value in sync while our local ``state`` still points at the previous image.
+        Always trust the live controls when opening the manual editor.
+        """
+        raw_image = _dropdown_value(image_dd)
+        if raw_image is not None:
+            try:
+                state["image_num"] = int(raw_image)
+            except (TypeError, ValueError):
+                pass
+        raw_visit = _dropdown_value(visit_dd)
+        if raw_visit is not None:
+            state["visit"] = str(raw_visit)
 
     def review_click(e):
+        _sync_selection_from_controls()
         if on_review_correct is None or state["image_num"] is None:
             page.snack_bar = ft.SnackBar(
                 ft.Text("Select a result image first, then press Review & Correct.")

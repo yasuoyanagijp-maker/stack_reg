@@ -10,6 +10,7 @@ from app.core.registration import (
     filter_correspondences_by_residual,
     nudge_affine_matrix,
 )
+from app.core.pipeline import realign_plan_to_reference
 from app.core.manual_align import (
     to_png_bytes,
     make_overlay,
@@ -72,6 +73,19 @@ def _capture_folder(plan, idx: int) -> str:
     return caps[idx] if 0 <= idx < len(caps) else ""
 
 
+def _capture_folder_suffix(plan, idx: int) -> str:
+    """
+    `` — {folder}`` only when the folder name differs from the capture number.
+
+    Numbered folders (``1``, ``2``, …) matching ``idx+1`` omit the suffix so
+    labels stay ``Capture 1`` instead of ``Capture 1 — 1``.
+    """
+    folder = _capture_folder(plan, idx)
+    if not folder or folder == str(idx + 1):
+        return ""
+    return f" — {_short_name(folder)}"
+
+
 def _resize_for_display(img: np.ndarray, width: int = DISPLAY_W):
     """Return (display_grayscale, scale) where scale maps display -> full coords."""
     import cv2
@@ -129,6 +143,11 @@ def create_manual_align_view(
     points = {}
     # diag[(visit, capture)] = {"ref": Nx2, "src": Nx2} automatic ORB matches (proposal 1)
     diag = {}
+    # Per-visit alignment reference (0-based). Default Capture 1 / index 0.
+    ref_by_visit = {
+        p.visit_name: int(getattr(p, "reference_idx", 0)) for p in plans
+    }
+    initial_ref_by_visit = dict(ref_by_visit)
 
     _page_w = getattr(page, "width", None)
     if not _page_w:
@@ -149,9 +168,30 @@ def create_manual_align_view(
         "suppress_add": False,
     }
 
+    def _ref_idx(visit: str | None = None) -> int:
+        return int(ref_by_visit[visit or state["visit"]])
+
+    def _ref_label(plan, ref_idx: int | None = None) -> str:
+        r = _ref_idx(plan.visit_name) if ref_idx is None else int(ref_idx)
+        return f"Reference (Capture {r + 1}{_capture_folder_suffix(plan, r)})"
+
     # --- Controls ---------------------------------------------------------
     visit_row = ft.Row(wrap=True, spacing=6)
     capture_list = ft.ListView(expand=True, spacing=4, padding=4)
+    ref_dropdown = ft.Dropdown(
+        label="Alignment reference",
+        width=LEFT_PANEL_W - 24,
+        options=[
+            ft.DropdownOption(
+                key=str(i),
+                text=f"Capture {i + 1}{_capture_folder_suffix(plans[0], i)}",
+            )
+            for i in range(len(plans[0].matrices))
+        ],
+        value=str(_ref_idx()),
+        enable_search=False,
+        # on_select wired after change_reference is defined
+    )
 
     ref_img = ft.Image(width=initial_w, height=initial_w, fit=ft.BoxFit.FILL,
                        border_radius=6, src=_PLACEHOLDER_PNG)
@@ -159,6 +199,17 @@ def create_manual_align_view(
                        border_radius=6, src=_PLACEHOLDER_PNG)
     preview_img = ft.Image(width=initial_w, height=initial_w, fit=ft.BoxFit.FILL,
                            border_radius=6, src=_PREVIEW_PLACEHOLDER_PNG)
+
+    # Shown once every alignable capture is Accepted or Excluded (overview before Finalize).
+    overlay_gallery_title = ft.Text(
+        "All overlays — confirm before Finalize",
+        size=13,
+        weight=ft.FontWeight.BOLD,
+        color=ft.Colors.CYAN_200,
+        visible=False,
+    )
+    overlay_gallery = ft.Row(spacing=10, wrap=True, visible=False)
+    _GALLERY_TILE = 128
 
     layer_hint = (
         f" (image{focus_layer + 1})" if focus_layer is not None else ""
@@ -170,9 +221,14 @@ def create_manual_align_view(
     cc_text = ft.Text("", size=13, color=ft.Colors.GREY_300)
 
     ref_caption = ft.Text(
-        f"Reference (Capture 1 — {_short_name(_capture_folder(plans[0], 0))})",
+        _ref_label(plans[0]),
         size=13, weight=ft.FontWeight.BOLD)
     src_caption = ft.Text("Source", size=13, weight=ft.FontWeight.BOLD)
+    captures_heading = ft.Text(
+        f"Captures (aligned to Capture {_ref_idx() + 1})",
+        size=14,
+        weight=ft.FontWeight.BOLD,
+    )
 
     def cur_points():
         key = (state["visit"], state["capture"])
@@ -212,9 +268,9 @@ def create_manual_align_view(
         render_images()
         plan = plans_by_name[state["visit"]]
         try:
-            if cap == 0:
+            if cap == _ref_idx():
                 stack = display_stack_for(plan)
-                preview_img.src = to_png_bytes(stack[0], max_side=new_w)
+                preview_img.src = to_png_bytes(stack[_ref_idx()], max_side=new_w)
             else:
                 _refresh_preview(plan, cap)
         except Exception:
@@ -281,7 +337,8 @@ def create_manual_align_view(
         if cap is None:
             return
         stack = display_stack_for(plan)
-        ref_full = stack[0]
+        ref_i = _ref_idx()
+        ref_full = stack[ref_i]
         src_full = stack[cap]
         dw = _disp_w()
         ref_disp, disp_h, scale = _resize_for_display(ref_full, width=dw)
@@ -295,7 +352,7 @@ def create_manual_align_view(
         preview_img.height = disp_h
 
         # Optional diagnostic ORB matches under the pin landmarks.
-        if state["show_diag"] and cap != 0:
+        if state["show_diag"] and cap != ref_i:
             matrix = _current_matrix(plan, cap)
             mask = _diag_mask(plan, cap, matrix)
             key = (plan.visit_name, cap)
@@ -318,19 +375,18 @@ def create_manual_align_view(
         )
         ref_img.src = to_png_bytes(ref_marked)
         src_img.src = to_png_bytes(src_marked)
-        ref_caption.value = (
-            f"Reference (Capture 1 — {_short_name(_capture_folder(plan, 0))}) — green"
-        )
+        ref_caption.value = f"{_ref_label(plan)} — green"
         src_caption.value = (
-            f"Source (Capture {cap+1} — {_short_name(_capture_folder(plan, cap))}) — magenta"
+            f"Source (Capture {cap+1}{_capture_folder_suffix(plan, cap)}) — magenta"
         )
         page.update()
 
     def _show_matrix_preview(plan, cap, matrix, *, note: str = ""):
         stack = display_stack_for(plan)
-        overlay = make_overlay(stack[0], stack[cap], matrix)
+        ref_i = _ref_idx(plan.visit_name)
+        overlay = make_overlay(stack[ref_i], stack[cap], matrix)
         preview_img.src = to_png_bytes(overlay, max_side=_disp_w())
-        cc = compute_alignment_cc(stack[0], stack[cap], matrix)
+        cc = compute_alignment_cc(stack[ref_i], stack[cap], matrix)
         n_in = n_tot = None
         mask = _diag_mask(plan, cap, matrix)
         if mask is not None:
@@ -344,25 +400,156 @@ def create_manual_align_view(
         cc_text.color = ft.Colors.CYAN_200
         page.update()
 
+    def _visit_review_complete(plan) -> bool:
+        """
+        True when every alignable capture is Accepted (override), Excluded, or
+        is the reference — ready for an all-overlays confirmation overview.
+        """
+        visit = plan.visit_name
+        ref_i = _ref_idx(visit)
+        for idx in range(len(plan.matrices)):
+            if idx == ref_i:
+                continue
+            if idx in excluded[visit]:
+                continue
+            if idx in overrides[visit]:
+                continue
+            return False
+        # Need at least one non-excluded capture remaining for averaging.
+        n_caps = len(plan.matrices)
+        if n_caps - len(excluded[visit]) < 1:
+            return False
+        # Only show overview after the user has made at least one decision
+        # (otherwise a single-capture visit would always look "complete").
+        if not overrides[visit] and not excluded[visit]:
+            return False
+        return True
+
+    def _overlay_png_for_capture(plan, idx, max_side: int = _GALLERY_TILE) -> bytes:
+        stack = display_stack_for(plan)
+        ref_i = _ref_idx(plan.visit_name)
+        if idx == ref_i:
+            return to_png_bytes(stack[ref_i], max_side=max_side)
+        matrix = overrides[plan.visit_name].get(idx, plan.matrices[idx])
+        overlay = make_overlay(stack[ref_i], stack[idx], matrix)
+        return to_png_bytes(overlay, max_side=max_side)
+
+    def refresh_overlay_gallery(*, do_update: bool = True):
+        """
+        When every non-reference capture is Accepted or Excluded, show a strip of
+        overlay previews for all non-excluded captures so the user can confirm
+        before Finalize.
+        """
+        plan = plans_by_name[state["visit"]]
+        complete = _visit_review_complete(plan)
+        overlay_gallery.controls.clear()
+        if not complete:
+            overlay_gallery.visible = False
+            overlay_gallery_title.visible = False
+            if do_update:
+                try:
+                    page.update()
+                except Exception:
+                    pass
+            return
+
+        visit = plan.visit_name
+        ref_i = _ref_idx(visit)
+        for idx in range(len(plan.matrices)):
+            if idx in excluded[visit]:
+                continue
+            try:
+                png = _overlay_png_for_capture(plan, idx)
+            except Exception:
+                png = _PREVIEW_PLACEHOLDER_PNG
+            is_ref = idx == ref_i
+            is_corr = idx in overrides[visit]
+            if is_ref:
+                badge, col = "ref", ft.Colors.CYAN_300
+            elif is_corr:
+                badge, col = "accepted", ft.Colors.GREEN_400
+            else:
+                badge, col = "auto", ft.Colors.GREY_400
+            label = f"Cap {idx + 1}"
+            if is_ref:
+                label += " (ref)"
+            selected = idx == state["capture"]
+            overlay_gallery.controls.append(
+                ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Image(
+                                src=png,
+                                width=_GALLERY_TILE,
+                                height=_GALLERY_TILE,
+                                fit=ft.BoxFit.CONTAIN,
+                                border_radius=4,
+                            ),
+                            ft.Text(label, size=11, weight=ft.FontWeight.BOLD),
+                            ft.Text(badge, size=10, color=col),
+                        ],
+                        spacing=2,
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        tight=True,
+                    ),
+                    padding=6,
+                    border_radius=6,
+                    bgcolor=ft.Colors.CYAN_900 if selected else ft.Colors.GREY_900,
+                    border=ft.Border.all(
+                        1, ft.Colors.CYAN_400 if selected else ft.Colors.GREY_700
+                    ),
+                    on_click=lambda _, i=idx: select_capture(i),
+                    tooltip=f"Show Capture {idx + 1} in the editor",
+                )
+            )
+
+        overlay_gallery.visible = True
+        overlay_gallery_title.visible = True
+        overlay_gallery_title.value = (
+            f"All overlays ({len(overlay_gallery.controls)} captures) — "
+            "confirm before Finalize"
+        )
+        if do_update:
+            try:
+                page.update()
+            except Exception:
+                pass
+
     def _load_diagnostics(plan, idx):
         key = (plan.visit_name, idx)
         if key in diag:
             return
         stack = display_stack_for(plan)
-        extracted = extract_feature_correspondences(stack[0], stack[idx])
+        ref_i = _ref_idx(plan.visit_name)
+        extracted = extract_feature_correspondences(stack[ref_i], stack[idx])
         if extracted is None:
             diag[key] = None
             return
         ref_pts, src_pts = extracted
         diag[key] = {"ref": ref_pts, "src": src_pts}
 
+    def _sync_ref_dropdown(plan):
+        n = len(plan.matrices)
+        ref_dropdown.options = [
+            ft.DropdownOption(
+                key=str(i),
+                text=f"Capture {i + 1}{_capture_folder_suffix(plan, i)}",
+            )
+            for i in range(n)
+        ]
+        ref_dropdown.value = str(_ref_idx(plan.visit_name))
+        captures_heading.value = (
+            f"Captures (aligned to Capture {_ref_idx(plan.visit_name) + 1})"
+        )
+
     def refresh_capture_list(*, do_update: bool = True):
         plan = plans_by_name[state["visit"]]
         capture_list.controls.clear()
-        for idx in range(0, len(plan.matrices)):  # include Capture 1 (reference)
+        ref_i = _ref_idx(plan.visit_name)
+        for idx in range(0, len(plan.matrices)):
             is_excl = idx in excluded[plan.visit_name]
             corrected = idx in overrides[plan.visit_name]
-            is_ref = idx == 0
+            is_ref = idx == ref_i
             if is_excl:
                 badge, col = "excluded", ft.Colors.RED_400
                 icon = ft.Icons.BLOCK
@@ -379,7 +566,7 @@ def create_manual_align_view(
             label = f"Capture {idx+1}"
             if is_ref:
                 label += " (ref)"
-            label += f" — {_short_name(_capture_folder(plan, idx))}"
+            label += _capture_folder_suffix(plan, idx)
             capture_list.controls.append(
                 ft.Container(
                     content=ft.Row([
@@ -407,7 +594,8 @@ def create_manual_align_view(
         if not force and key in points and (points[key]["ref"] or points[key]["src"]):
             return
         stack = display_stack_for(plan)
-        h, w = stack[0].shape[:2]
+        ref_i = _ref_idx(plan.visit_name)
+        h, w = stack[ref_i].shape[:2]
         matrix = overrides[plan.visit_name].get(idx, plan.matrices[idx])
         ref_pts, src_pts = seed_correspondences_from_matrix(matrix, h, w, n_points=6)
         points[key] = {"ref": ref_pts, "src": src_pts}
@@ -424,25 +612,25 @@ def create_manual_align_view(
         plan = plans_by_name[state["visit"]]
         state.pop("_pending_matrix", None)
         state["_baseline_matrix"] = None
+        ref_i = _ref_idx()
 
-        # Capture 1 (index 0) is the alignment reference — point editing N/A,
-        # but it can still be excluded from the average if quality is poor.
-        if idx == 0:
+        # Reference capture — point editing N/A; may still be excluded from average.
+        if idx == ref_i:
             if idx in excluded[state["visit"]]:
                 status_text.value = (
-                    "Capture 1 (reference) is EXCLUDED from the average. "
+                    f"Capture {idx + 1} (reference) is EXCLUDED from the average. "
                     "Toggle Exclude off to include it again."
                 )
             else:
                 status_text.value = (
-                    "Capture 1 is the alignment reference (identity). "
+                    f"Capture {idx + 1} is the alignment reference (identity). "
                     "Point correction is not needed; use Exclude if this capture "
                     "should be omitted from the average."
                 )
             try:
                 stack = display_stack_for(plan)
                 # Show reference alone (no warp overlay).
-                preview_img.src = to_png_bytes(stack[0], max_side=_disp_w())
+                preview_img.src = to_png_bytes(stack[ref_i], max_side=_disp_w())
                 cc_text.value = "Reference capture — Exclude available"
                 cc_text.color = ft.Colors.GREY_300
             except Exception:
@@ -470,19 +658,159 @@ def create_manual_align_view(
             )
         try:
             matrix = _stored_matrix(plan, idx)
-            _set_matrix(matrix, acceptible=False)
+            # Baseline is Accept-ready so auto alignment can be confirmed as-is.
+            _set_matrix(matrix, acceptible=True)
             _show_matrix_preview(plan, idx, matrix, note="baseline")
         except Exception:
             pass
         refresh_capture_list()
         render_images()
 
+    def change_reference(new_ref: int):
+        """
+        Re-run automatic registration onto ``new_ref`` for the focus image only,
+        then refresh the manual corresponding-point editor.
+        """
+        visit = state["visit"]
+        plan = plans_by_name[visit]
+        new_ref = int(new_ref)
+        old_ref = _ref_idx(visit)
+        if new_ref == old_ref:
+            return
+        if not (0 <= new_ref < len(plan.matrices)):
+            return
+
+        layer_label = (
+            f"image{focus_layer + 1}" if focus_layer is not None else "Image 5"
+        )
+        status_text.value = (
+            f"Auto-registering → Capture {new_ref + 1} "
+            f"({layer_label} of this Visit only)…"
+        )
+        cc_text.value = ""
+        ref_dropdown.disabled = True
+        try:
+            page.update()
+        except Exception:
+            pass
+
+        stack = display_stack_for(plan)
+        logs: list[str] = []
+
+        def _log(msg: str):
+            logs.append(str(msg))
+
+        def _apply_success():
+            overrides[visit].clear()
+            ref_by_visit[visit] = int(plan.reference_idx)
+            for key in list(points.keys()):
+                if key[0] == visit:
+                    points.pop(key, None)
+            for key in list(diag.keys()):
+                if key[0] == visit:
+                    diag.pop(key, None)
+            state.pop("_pending_matrix", None)
+            state["_baseline_matrix"] = None
+            state["selected"] = None
+            state["dragging"] = False
+            _sync_ref_dropdown(plan)
+            captures_heading.value = (
+                f"Captures (aligned to Capture {new_ref + 1})"
+            )
+            status_text.value = (
+                f"Auto-registered to Capture {new_ref + 1} ({layer_label}). "
+                "Pins cleared — select a capture to refine corresponding points."
+            )
+            cap = state["capture"]
+            refresh_capture_list(do_update=False)
+            refresh_overlay_gallery(do_update=False)
+            if cap is None:
+                ref_caption.value = _ref_label(plan)
+                src_caption.value = "Source"
+            else:
+                # Avoid nested page.update from select_capture until enabled again.
+                select_capture(cap)
+
+        def _run_realign():
+            realign_plan_to_reference(
+                plan,
+                new_ref,
+                stack=stack,
+                layer_idx=None,  # stack already scoped to focus layer
+                auto_refine=True,
+                log_callback=_log,
+            )
+
+        def _finish_ok():
+            ref_dropdown.disabled = False
+            _apply_success()
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        def _finish_err(exc: BaseException):
+            ref_dropdown.disabled = False
+            ref_dropdown.value = str(old_ref)
+            status_text.value = (
+                f"Auto-registration to Capture {new_ref + 1} failed: {exc}"
+            )
+            cc_text.value = ""
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        run_thread = getattr(page, "run_thread", None)
+        if callable(run_thread):
+            def work():
+                try:
+                    _run_realign()
+                    run_task = getattr(page, "run_task", None)
+                    if callable(run_task):
+                        async def _ui():
+                            _finish_ok()
+                        run_task(_ui)
+                    else:
+                        _finish_ok()
+                except Exception as exc:
+                    run_task = getattr(page, "run_task", None)
+                    if callable(run_task):
+                        async def _ui_err(e=exc):
+                            _finish_err(e)
+                        run_task(_ui_err)
+                    else:
+                        _finish_err(exc)
+
+            run_thread(work)
+        else:
+            # Headless / smoke tests: run synchronously.
+            try:
+                _run_realign()
+                _finish_ok()
+            except Exception as exc:
+                _finish_err(exc)
+
+    def on_ref_dropdown_select(e):
+        raw = getattr(ref_dropdown, "value", None)
+        if raw is None and e is not None:
+            raw = getattr(getattr(e, "control", None), "value", None)
+        if raw is None:
+            return
+        try:
+            change_reference(int(raw))
+        except (TypeError, ValueError):
+            pass
+
     def select_visit(name):
         state["visit"] = name
         state["capture"] = None
         state.pop("_pending_matrix", None)
         state["_baseline_matrix"] = None
+        plan = plans_by_name[name]
+        _sync_ref_dropdown(plan)
         refresh_capture_list()
+        refresh_overlay_gallery(do_update=False)
         dw = _disp_w()
         ref_img.width = dw
         src_img.width = dw
@@ -493,8 +821,7 @@ def create_manual_align_view(
         ref_img.src = _placeholder_png("No capture selected", side=dw)
         src_img.src = _placeholder_png("No capture selected", side=dw)
         preview_img.src = _placeholder_png("No preview computed", side=dw)
-        plan = plans_by_name[name]
-        ref_caption.value = f"Reference (Capture 1 — {_short_name(_capture_folder(plan, 0))})"
+        ref_caption.value = _ref_label(plan)
         src_caption.value = "Source"
         status_text.value = f"Select a capture on the left to begin{layer_hint}."
         page.update()
@@ -510,7 +837,7 @@ def create_manual_align_view(
         return nearest_landmark_index(disp_pts, disp_x, disp_y, _PIN_HIT_PX)
 
     def add_point(which, e):
-        if state["capture"] is None or state["capture"] == 0:
+        if state["capture"] is None or state["capture"] == _ref_idx():
             return
         if state.get("suppress_add"):
             state["suppress_add"] = False
@@ -545,7 +872,7 @@ def create_manual_align_view(
         render_images()
 
     def pan_start(which, e):
-        if state["capture"] is None or state["capture"] == 0:
+        if state["capture"] is None or state["capture"] == _ref_idx():
             return
         xy = _event_xy(e)
         if xy is None:
@@ -631,7 +958,7 @@ def create_manual_align_view(
         render_images()
 
     def reset_points(e):
-        if state["capture"] is None:
+        if state["capture"] is None or state["capture"] == _ref_idx():
             return
         plan = plans_by_name[state["visit"]]
         _seed_auto_points(plan, state["capture"], force=True)
@@ -651,8 +978,10 @@ def create_manual_align_view(
     def clear_points(e):
         if state["capture"] is None:
             return
-        if state["capture"] == 0:
-            status_text.value = "Capture 1 (ref) has no editable pins."
+        if state["capture"] == _ref_idx():
+            status_text.value = (
+                f"Capture {_ref_idx() + 1} (ref) has no editable pins."
+            )
             page.update()
             return
         key = (state["visit"], state["capture"])
@@ -699,14 +1028,16 @@ def create_manual_align_view(
                 f"Capture {idx+1} EXCLUDED from average (poor quality / unalignable)."
             )
         refresh_capture_list()
+        refresh_overlay_gallery()
         page.update()
 
     def compute_preview(e):
         if state["capture"] is None:
             return
-        if state["capture"] == 0:
+        if state["capture"] == _ref_idx():
             status_text.value = (
-                "Capture 1 is the reference — use Exclude instead of point correction."
+                f"Capture {_ref_idx() + 1} is the reference — "
+                "use Exclude instead of point correction."
             )
             page.update()
             return
@@ -728,8 +1059,9 @@ def create_manual_align_view(
             return
 
         stack = display_stack_for(plan)
-        auto_cc = compute_alignment_cc(stack[0], stack[cap], plan.matrices[cap])
-        manual_cc = compute_alignment_cc(stack[0], stack[cap], matrix)
+        ref_i = _ref_idx()
+        auto_cc = compute_alignment_cc(stack[ref_i], stack[cap], plan.matrices[cap])
+        manual_cc = compute_alignment_cc(stack[ref_i], stack[cap], matrix)
         _set_matrix(matrix, acceptible=True)
         note = (
             f"pins → manual {manual_cc:.3f} vs auto {auto_cc:.3f}"
@@ -742,27 +1074,35 @@ def create_manual_align_view(
         page.update()
 
     def accept_correction(e):
-        if state["capture"] == 0:
+        if state["capture"] == _ref_idx():
             status_text.value = (
-                "Capture 1 is the reference — use Exclude instead of Accept."
+                f"Capture {_ref_idx() + 1} is the reference — "
+                "use Exclude instead of Accept."
             )
             page.update()
             return
+        # Pending (nudge/compute) preferred; else baseline so auto can be Accepted as-is.
         mat = state.get("_pending_matrix")
+        if mat is None:
+            mat = state.get("_baseline_matrix")
         if mat is None or state["capture"] is None:
-            status_text.value = "Nudge, drop outliers, or Compute & Preview before accepting."
+            status_text.value = (
+                "Select a capture, then Nudge / Compute & Preview, or Accept the "
+                "auto baseline."
+            )
             page.update()
             return
         visit = state["visit"]
         idx = state["capture"]
-        overrides[visit][idx] = mat
+        overrides[visit][idx] = np.asarray(mat, dtype=np.float32).reshape(2, 3).copy()
         excluded[visit].discard(idx)
         status_text.value = f"Capture {idx+1} correction accepted."
         refresh_capture_list()
+        refresh_overlay_gallery()
         page.update()
 
     def revert_auto(e):
-        if state["capture"] is None:
+        if state["capture"] is None or state["capture"] == _ref_idx():
             return
         visit = state["visit"]
         idx = state["capture"]
@@ -778,15 +1118,17 @@ def create_manual_align_view(
             preview_img.src = _PREVIEW_PLACEHOLDER_PNG
             cc_text.value = ""
         refresh_capture_list()
+        refresh_overlay_gallery()
         render_images()
 
     def apply_nudge(dx=0.0, dy=0.0, dtheta=0.0):
-        if state["capture"] is None or state["capture"] == 0:
+        if state["capture"] is None or state["capture"] == _ref_idx():
             return
         plan = plans_by_name[state["visit"]]
         cap = state["capture"]
         stack = display_stack_for(plan)
-        h, w = stack[0].shape[:2]
+        ref_i = _ref_idx()
+        h, w = stack[ref_i].shape[:2]
         base = _current_matrix(plan, cap)
         matrix = nudge_affine_matrix(
             base, dx=dx, dy=dy, dtheta_deg=dtheta, center=(w / 2.0, h / 2.0)
@@ -818,7 +1160,7 @@ def create_manual_align_view(
         render_images()
 
     def drop_outliers_refit(e):
-        if state["capture"] is None or state["capture"] == 0:
+        if state["capture"] is None or state["capture"] == _ref_idx():
             return
         plan = plans_by_name[state["visit"]]
         cap = state["capture"]
@@ -851,7 +1193,8 @@ def create_manual_align_view(
             _sync_src_pins_to_matrix(new_m)
         else:
             stack = display_stack_for(plan)
-            h, w = stack[0].shape[:2]
+            ref_i = _ref_idx()
+            h, w = stack[ref_i].shape[:2]
             ref_pts, src_pts = seed_correspondences_from_matrix(new_m, h, w, n_points=6)
             points[key] = {"ref": ref_pts, "src": src_pts}
         n_drop = int((~keep).sum())
@@ -865,7 +1208,7 @@ def create_manual_align_view(
     def on_residual_change(e):
         state["residual_px"] = float(e.control.value)
         residual_label.value = f"Residual ≤ {state['residual_px']:.0f} px"
-        if state["capture"] is not None and state["capture"] != 0:
+        if state["capture"] is not None and state["capture"] != _ref_idx():
             plan = plans_by_name[state["visit"]]
             cap = state["capture"]
             try:
@@ -887,9 +1230,14 @@ def create_manual_align_view(
         for (visit, cap), pt in points.items():
             if visit in clean_overrides and cap in clean_overrides[visit]:
                 clean_points.setdefault(visit, {})[cap] = pt
-        if not clean_overrides and not clean_excluded:
+        ref_changed = any(
+            ref_by_visit[v] != initial_ref_by_visit.get(v, 0)
+            for v in ref_by_visit
+        )
+        if not clean_overrides and not clean_excluded and not ref_changed:
             status_text.value = (
-                "No corrections or exclusions yet. Accept a preview, or Exclude a capture."
+                "No corrections, exclusions, or reference change yet. "
+                "Accept a preview, Exclude a capture, or change the reference."
             )
             page.update()
             return
@@ -898,6 +1246,8 @@ def create_manual_align_view(
             on_finalize(clean_overrides, clean_points, clean_excluded)
         except TypeError:
             on_finalize(clean_overrides, clean_points)
+
+    ref_dropdown.on_select = on_ref_dropdown_select
 
     # --- Build visit selector --------------------------------------------
     for p in plans:
@@ -994,26 +1344,14 @@ def create_manual_align_view(
     ], wrap=True, spacing=8)
 
     title_suffix = f" — image{focus_layer + 1}" if focus_layer is not None else ""
-    target_hint = (
-        f"Parameters from image{focus_layer + 1} are applied to all result images "
-        f"(image1–imageN) of this Visit only. Other Visits are not re-synthesized."
-        if focus_layer is not None
-        else "Finalize updates all result images of this Visit only."
-    )
 
     left_panel = ft.Container(
         content=ft.Column([
             ft.Text("Visits", size=14, weight=ft.FontWeight.BOLD),
             visit_row,
             ft.Divider(height=10),
-            ft.Text("Captures (aligned to Capture 1)", size=14, weight=ft.FontWeight.BOLD),
-            ft.Text(
-                "1) Nudge overlay  2) optional Clear points  3) click/drag pins\n"
-                "4) Compute & Preview → Accept. Nudge is kept after Clear.\n"
-                "Green/red dots = ORB diagnostics (not editable).\n"
-                f"{target_hint}",
-                size=11, color=ft.Colors.GREY_400,
-            ),
+            captures_heading,
+            ref_dropdown,
             capture_list,
         ], spacing=8, expand=True),
         width=LEFT_PANEL_W,
@@ -1032,6 +1370,8 @@ def create_manual_align_view(
 
     editor_panel = ft.Column([
         images_row,
+        overlay_gallery_title,
+        overlay_gallery,
         nudge_row,
         diag_row,
         control_row,
@@ -1063,5 +1403,6 @@ def create_manual_align_view(
     page.on_resize = _on_page_resize
 
     # Initialize selection without page.update — view is not mounted yet.
+    _sync_ref_dropdown(plans_by_name[state["visit"]])
     refresh_capture_list(do_update=False)
     return view

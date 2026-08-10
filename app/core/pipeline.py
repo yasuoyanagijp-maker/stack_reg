@@ -18,6 +18,7 @@ from app.core.registration import (
     average_project_stack,
     compute_alignment_cc,
     refine_affine_feature_based,
+    rebase_affine_matrices,
     DEFAULT_CONFIDENCE_THRESHOLD,
     REFINE_MIN_IMPROVEMENT,
 )
@@ -57,9 +58,12 @@ class VisitPlan:
     the expensive per-layer warping/averaging is committed.
 
     - ``ref_stack[i]`` is the pretreated "Image 5" average for capture ``i``.
-    - ``matrices[i]`` maps reference (capture 0) coords -> capture ``i`` coords
-      (``cv2.WARP_INVERSE_MAP`` convention).
+    - ``matrices[i]`` maps reference (``reference_idx``) coords -> capture ``i``
+      coords (``cv2.WARP_INVERSE_MAP`` convention). After auto-align,
+      ``reference_idx`` is 0 (Capture 1); choosing another reference in the
+      manual editor re-runs automatic registration for the focus image only.
     - ``scores[i]`` is the automatic alignment confidence for capture ``i``.
+    - ``reference_idx`` is the 0-based capture used as the alignment identity.
     """
     visit_dir: str
     visit_name: str
@@ -68,15 +72,52 @@ class VisitPlan:
     ref_stack: np.ndarray
     matrices: List[np.ndarray]
     scores: List[float] = field(default_factory=list)
+    reference_idx: int = 0
 
     def low_confidence_indices(
         self, threshold: float = DEFAULT_CONFIDENCE_THRESHOLD
     ) -> List[int]:
         """Capture indices (excluding the anchor) whose auto-alignment is suspect."""
+        ref = int(self.reference_idx)
         return [
             i for i, s in enumerate(self.scores)
-            if i > 0 and s < threshold
+            if i != ref and s < threshold
         ]
+
+    def set_reference_capture(
+        self,
+        new_ref_idx: int,
+        overrides: Optional[Dict[int, np.ndarray]] = None,
+        *,
+        layer_idx: Optional[int] = None,
+        stack: Optional[np.ndarray] = None,
+        auto_refine: bool = True,
+        progress_callback: Optional[Callable[[float, str], None]] = None,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> Dict[int, np.ndarray]:
+        """
+        Re-run automatic registration onto ``new_ref_idx`` for this Visit only
+        (see ``realign_plan_to_reference``). Prior overrides are discarded.
+        """
+        del overrides  # recomputed autos replace any prior manual matrices
+        new_ref_idx = int(new_ref_idx)
+        if (
+            new_ref_idx == int(self.reference_idx)
+            and stack is None
+            and layer_idx is None
+        ):
+            return {}
+        # Defined below in this module; resolved at call time.
+        realign_plan_to_reference(
+            self,
+            new_ref_idx,
+            layer_idx=layer_idx,
+            stack=stack,
+            auto_refine=auto_refine,
+            progress_callback=progress_callback,
+            log_callback=log_callback,
+        )
+        return {}
 
     def load_layer_stack(self, layer_idx: int) -> np.ndarray:
         """
@@ -118,6 +159,7 @@ def auto_refine_matrices(
     min_improvement: float = REFINE_MIN_IMPROVEMENT,
     refine_fn: Callable = refine_affine_feature_based,
     log: Optional[Callable[[str], None]] = None,
+    reference_idx: int = 0,
 ) -> List[int]:
     """
     For every capture whose confidence is below ``threshold``, run ``refine_fn``
@@ -129,11 +171,14 @@ def auto_refine_matrices(
     before manual corresponding-point correction.
     """
     log = log or _noop_log
+    ref_i = int(reference_idx)
     refined: List[int] = []
-    for i in range(1, len(matrices)):
+    for i in range(len(matrices)):
+        if i == ref_i:
+            continue
         if scores[i] >= threshold:
             continue
-        result = refine_fn(ref_stack[0], ref_stack[i])
+        result = refine_fn(ref_stack[ref_i], ref_stack[i])
         if result is None:
             log(f"  [AUTO-REFINE] Capture {i+1}: feature matching found too few points; keeping auto.")
             continue
@@ -153,6 +198,91 @@ def auto_refine_matrices(
             )
     return refined
 
+
+def realign_plan_to_reference(
+    plan: "VisitPlan",
+    reference_idx: int,
+    *,
+    layer_idx: Optional[int] = None,
+    stack: Optional[np.ndarray] = None,
+    auto_refine: bool = True,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> None:
+    """
+    Re-run **automatic** affine registration for a single Visit onto
+    ``reference_idx`` (identity).
+
+    Scope:
+    - Uses ``stack`` when provided; else loads only ``layer_idx`` (focus image);
+      else falls back to ``plan.ref_stack`` (Image 5).
+    - Does **not** process other Visits or other analysis target images.
+    - Updates ``plan.matrices``, ``plan.scores``, and ``plan.reference_idx`` only.
+    """
+    progress = progress_callback or _noop_progress
+    log = log_callback or _noop_log
+    ref_i = int(reference_idx)
+    n = len(plan.matrices)
+    if not (0 <= ref_i < n):
+        raise ValueError(
+            f"reference capture {ref_i} out of range for {n} capture(s)."
+        )
+
+    if stack is not None:
+        work = stack
+        src_label = "provided stack"
+    elif layer_idx is not None:
+        work = plan.load_layer_stack(int(layer_idx))
+        src_label = f"image{int(layer_idx) + 1}"
+    else:
+        work = plan.ref_stack
+        src_label = "Image 5 reference stack"
+
+    if work.shape[0] != n:
+        raise ValueError(
+            f"Stack has {work.shape[0]} captures but plan has {n}."
+        )
+
+    log(
+        f"  [REF] Auto-registering {plan.visit_name} captures → Capture {ref_i + 1} "
+        f"using {src_label} only (not other images/Visits)."
+    )
+    progress(0.02, f"[{plan.visit_name}] Re-registering → Capture {ref_i + 1}…")
+
+    def align_cb(inner_val, inner_status):
+        progress(0.05 + inner_val * 0.85, f"[{plan.visit_name}] {inner_status}")
+
+    matrices, ecc_scores = calculate_affine_transformations(
+        work,
+        progress_callback=align_cb,
+        log_callback=log,
+        return_scores=True,
+        reference_idx=ref_i,
+    )
+
+    # Prefer intensity CC (same metric as prepare_visit) for UI comparability.
+    scores = [1.0 if i == ref_i else 0.0 for i in range(n)]
+    for i in range(n):
+        if i == ref_i:
+            continue
+        scores[i] = compute_alignment_cc(work[ref_i], work[i], matrices[i])
+        # Keep ECC seed if CC somehow fails numerically.
+        if scores[i] <= 0.0 and ecc_scores[i] > 0.0:
+            scores[i] = float(ecc_scores[i])
+
+    if auto_refine:
+        auto_refine_matrices(
+            work, matrices, scores, log=log, reference_idx=ref_i
+        )
+
+    plan.matrices = matrices
+    plan.scores = scores
+    plan.reference_idx = ref_i
+    progress(1.0, f"[{plan.visit_name}] Re-registration ready.")
+    log(
+        f"  [REF] Done. Capture {ref_i + 1} is identity; "
+        f"{n - 1} other capture(s) aligned to it."
+    )
 
 def prepare_visit(
     visit_dir: str,
@@ -262,9 +392,11 @@ def finalize_visit(
     the user edits from Review & Correct for ``imageN``, pass ``[N-1]`` so other
     images are left untouched. ``None`` means all layers (initial Run Registration).
 
-    ``excluded_captures`` (0-based capture indices, including the reference
-    capture 0 if desired) are omitted from the average. At least one capture
-    must remain.
+    ``excluded_captures`` (0-based capture indices, including the current
+    alignment reference if desired) are omitted from the average. At least one
+    capture must remain. Matrices are applied in whatever reference frame
+    ``plan.matrices`` / overrides currently use (see ``plan.reference_idx``);
+    the average is therefore expressed in that reference capture's coordinates.
 
     When ``persist_overrides`` is True, accepted matrices are written back into
     ``plan.matrices`` so a second correction round starts from the new baseline.
@@ -283,6 +415,19 @@ def finalize_visit(
             if 0 <= idx < len(matrices):
                 matrices[idx] = np.asarray(mat, dtype=np.float32)
                 log(f"  [MANUAL] Capture {idx+1} using manual corresponding-point matrix.")
+
+    ref_i = int(getattr(plan, "reference_idx", 0))
+    if not (0 <= ref_i < len(matrices)):
+        ref_i = 0
+    if matrices and not np.allclose(matrices[ref_i], np.eye(2, 3), atol=1e-5):
+        log(
+            f"  [REF] Capture {ref_i + 1} was not identity — "
+            "rebasing working matrices onto it."
+        )
+        matrices = rebase_affine_matrices(matrices, ref_i)
+    if matrices:
+        matrices[ref_i] = np.eye(2, 3, dtype=np.float32)
+    log(f"  [REF] Alignment reference: Capture {ref_i + 1}")
 
     total_captures = len(sorted_captures)
     total_layers = len(folder_contents[sorted_captures[0]])

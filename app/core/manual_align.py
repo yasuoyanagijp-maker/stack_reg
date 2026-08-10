@@ -205,3 +205,12 @@ def overrides_from_session(session: Dict) -> Dict[str, Dict[int, np.ndarray]]:
             for idx, mat in overrides.items()
         }
     return result
+
+
+def reference_indices_from_session(session: Dict) -> Dict[str, int]:
+    """Optional per-visit alignment reference (0-based) from a saved session."""
+    result: Dict[str, int] = {}
+    for visit_name, data in session.get("visits", {}).items():
+        if "reference_idx" in data:
+            result[visit_name] = int(data["reference_idx"])
+    return result

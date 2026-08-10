@@ -39,11 +39,12 @@ def calculate_affine_transformations(
     progress_callback: Optional[Callable[[float, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     return_scores: bool = False,
+    reference_idx: int = 0,
 ):
     """
-    Calculates the Affine transformation matrix for each slice in the 
-    reference stack relative to the first slice.
-    
+    Calculates the Affine transformation matrix for each slice in the
+    reference stack relative to ``reference_idx`` (identity anchor).
+
     High-Precision Pyramid Logic (for Perfect Peripheral Alignment):
     1.  Initial Seed: `cv2.matchTemplate` at the coarsest level for global position.
     2.  Full Affine Refinement: Use `cv2.MOTION_AFFINE` at ALL pyramid levels for maximum 
@@ -56,21 +57,29 @@ def calculate_affine_transformations(
             (finest-resolution ECC correlation, in roughly 0..1) so callers can
             flag captures whose automatic alignment is unreliable and route them
             to manual corresponding-point review.
+        reference_idx: 0-based capture index used as the alignment identity
+            (default 0 = Capture 1).
         
     Returns:
         A list of 2x3 Affine transformation matrices, or, when ``return_scores``
         is True, a tuple ``(matrices, scores)`` where ``scores[i]`` is the
-        confidence for slice ``i`` (slice 0, the anchor, is always 1.0).
+        confidence for slice ``i`` (the anchor is always 1.0).
     """
     logger = logging.getLogger(__name__)
     num_slices = reference_stack.shape[0]
-    
-    # Anchor (Slice 0) is always Identity.
-    matrices = [np.eye(2, 3, dtype=np.float32)]
-    # Confidence per slice; the anchor is a perfect self-match by definition.
-    scores: List[float] = [1.0]
-    
-    target_slice = reference_stack[0].astype(np.float32)
+    ref_i = int(reference_idx)
+    if not (0 <= ref_i < num_slices):
+        raise ValueError(
+            f"reference_idx {reference_idx} out of range for {num_slices} slice(s)."
+        )
+
+    matrices: List[np.ndarray] = [
+        np.eye(2, 3, dtype=np.float32) for _ in range(num_slices)
+    ]
+    scores: List[float] = [0.0] * num_slices
+    scores[ref_i] = 1.0
+
+    target_slice = reference_stack[ref_i].astype(np.float32)
     # Using min_size=64 for a robust pyramid structure.
     target_pyramid = build_gaussian_pyramid(target_slice, min_size=64)
     num_levels = len(target_pyramid)
@@ -86,10 +95,16 @@ def calculate_affine_transformations(
                       [0.0, 0.5, 0.0],
                       [0.0, 0.0, 1.0]], dtype=np.float64)
                       
-    logger.info(f"Starting Precision Multi-resolution Registration ({num_levels} levels) on {num_slices} slices...")
+    logger.info(
+        f"Starting Precision Multi-resolution Registration ({num_levels} levels) "
+        f"on {num_slices} slices (reference=Capture {ref_i + 1})..."
+    )
     
-    total_alignments = num_slices - 1
-    for i in range(1, num_slices):
+    total_alignments = max(1, num_slices - 1)
+    done = 0
+    for i in range(num_slices):
+        if i == ref_i:
+            continue
         source_slice = reference_stack[i].astype(np.float32)
         source_pyramid = build_gaussian_pyramid(source_slice, min_size=64)
         
@@ -107,9 +122,11 @@ def calculate_affine_transformations(
             curr_target = target_pyramid[level_res]
             curr_source = source_pyramid[level_res]
             
-            msg = f"Aligning Slice {i+1}/{num_slices} [Level {level_res}]"
+            msg = f"Aligning Slice {i+1}/{num_slices} → ref {ref_i + 1} [Level {level_res}]"
             if progress_callback:
-                level_prog = ((i - 1) / total_alignments) + (level_idx / (effective_levels * total_alignments))
+                level_prog = (done / total_alignments) + (
+                    level_idx / (effective_levels * total_alignments)
+                )
                 progress_callback(level_prog, msg)
 
             try:
@@ -157,15 +174,16 @@ def calculate_affine_transformations(
                 M_scaled = S @ M_3x3 @ S_inv
                 warp_matrix = M_scaled[:2, :].astype(np.float32)
         
-        matrices.append(warp_matrix)
+        matrices[i] = warp_matrix
         # Fall back to the coarse matchTemplate seed strength when ECC never
         # produced a finest-level correlation (alignment effectively failed).
-        scores.append(slice_score if slice_score > 0.0 else seed_val)
+        scores[i] = slice_score if slice_score > 0.0 else seed_val
+        done += 1
 
-        if slice_score < DEFAULT_CONFIDENCE_THRESHOLD:
+        if scores[i] < DEFAULT_CONFIDENCE_THRESHOLD:
             warn = (
                 f"  [LOW CONFIDENCE] Slice {i+1} alignment score "
-                f"{scores[-1]:.3f} (< {DEFAULT_CONFIDENCE_THRESHOLD}). "
+                f"{scores[i]:.3f} (< {DEFAULT_CONFIDENCE_THRESHOLD}). "
                 "Consider manual corresponding-point correction."
             )
             logger.warning(warn)
@@ -173,7 +191,7 @@ def calculate_affine_transformations(
                 log_callback(warn)
 
         if progress_callback:
-            progress_callback(i / total_alignments, f"Slice {i+1}/{num_slices} Aligned.")
+            progress_callback(done / total_alignments, f"Slice {i+1}/{num_slices} Aligned.")
         
         del source_pyramid
         
@@ -221,6 +239,52 @@ def apply_transformations_to_stack(
         )
         
     return transformed_stack
+
+
+def invert_affine_2x3(matrix: np.ndarray) -> np.ndarray:
+    """Invert a 2x3 affine matrix (homogeneous 3x3 invert, return 2x3)."""
+    m = np.asarray(matrix, dtype=np.float64).reshape(2, 3)
+    m3 = np.vstack([m, [0.0, 0.0, 1.0]])
+    inv = np.linalg.inv(m3)
+    return inv[:2, :].astype(np.float32)
+
+
+def compose_affine_2x3(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Compose 2x3 affines as ``A @ B`` (apply ``B`` first, then ``A``).
+    """
+    a3 = np.vstack([np.asarray(a, dtype=np.float64).reshape(2, 3), [0.0, 0.0, 1.0]])
+    b3 = np.vstack([np.asarray(b, dtype=np.float64).reshape(2, 3), [0.0, 0.0, 1.0]])
+    return (a3 @ b3)[:2, :].astype(np.float32)
+
+
+def rebase_affine_matrices(
+    matrices: List[np.ndarray],
+    new_ref_idx: int,
+) -> List[np.ndarray]:
+    """
+    Re-express capture matrices so ``new_ref_idx`` becomes the identity anchor.
+
+    Input convention: ``matrices[i]`` maps *current* reference coords → capture
+    ``i`` coords (``WARP_INVERSE_MAP``). Output: ``matrices'[new_ref]`` is
+    identity and ``matrices'[i]`` maps *new* reference coords → capture ``i``.
+
+    Composition: ``M'_i = M_i @ inv(M_new_ref)``.
+    """
+    mats = [np.asarray(m, dtype=np.float32).reshape(2, 3) for m in matrices]
+    n = len(mats)
+    if n == 0:
+        return []
+    if not (0 <= int(new_ref_idx) < n):
+        raise ValueError(
+            f"new_ref_idx {new_ref_idx} out of range for {n} capture(s)."
+        )
+    new_ref_idx = int(new_ref_idx)
+    inv_pivot = invert_affine_2x3(mats[new_ref_idx])
+    out = [compose_affine_2x3(m, inv_pivot) for m in mats]
+    out[new_ref_idx] = np.eye(2, 3, dtype=np.float32)
+    return out
+
 
 def estimate_affine_from_correspondences(
     reference_points: np.ndarray,

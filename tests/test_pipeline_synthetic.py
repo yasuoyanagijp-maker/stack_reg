@@ -13,6 +13,7 @@ from app.core.manual_align import (
     save_session,
     load_session,
     overrides_from_session,
+    reference_indices_from_session,
 )
 
 
@@ -168,6 +169,48 @@ def test_finalize_can_exclude_reference_capture(tmp_path):
     assert not np.array_equal(a, b)
 
 
+def test_realign_plan_to_reference_focus_layer_and_finalize(tmp_path):
+    """Changing reference re-runs auto-registration on one layer only."""
+    from app.core.pipeline import realign_plan_to_reference
+
+    visit = tmp_path / "visit"
+    _write_synthetic_visit(str(visit), n_captures=3, n_layers=2)
+    plan = prepare_visit(str(visit))
+    assert plan.reference_idx == 0
+    assert np.allclose(plan.matrices[0], np.eye(2, 3))
+
+    loaded = []
+    orig_load = plan.load_layer_stack
+
+    def spy_load(layer_idx):
+        loaded.append(int(layer_idx))
+        return orig_load(layer_idx)
+
+    plan.load_layer_stack = spy_load  # type: ignore[method-assign]
+
+    realign_plan_to_reference(plan, reference_idx=2, layer_idx=1, auto_refine=True)
+    assert loaded == [1], "must load only the focus layer, not all images"
+    assert plan.reference_idx == 2
+    assert np.allclose(plan.matrices[2], np.eye(2, 3), atol=1e-5)
+    for i, m in enumerate(plan.matrices):
+        assert m.shape == (2, 3)
+        assert np.isfinite(m).all()
+    # Capture 1 is no longer the forced identity after re-registration.
+    assert not np.allclose(plan.matrices[0], np.eye(2, 3), atol=1e-3)
+
+    out = tmp_path / "out_ref2"
+    out.mkdir()
+    ok = finalize_visit(plan, "P", str(out), target_layers=[0, 1])
+    assert ok
+    assert list(out.glob("*.tif"))
+
+    # Round-trip: re-register back onto Capture 1 using image1 only.
+    realign_plan_to_reference(plan, reference_idx=0, layer_idx=0)
+    assert plan.reference_idx == 0
+    assert np.allclose(plan.matrices[0], np.eye(2, 3), atol=1e-5)
+    assert loaded == [1, 0]
+
+
 def test_run_pipeline_end_to_end_with_overrides(tmp_path):
     patient = tmp_path / "Patient"
     _write_synthetic_visit(str(patient / "VisitA"), n_captures=2, n_layers=2)
@@ -198,6 +241,7 @@ def test_session_round_trip(tmp_path):
                 "auto_matrices": [np.eye(2, 3).tolist(), np.eye(2, 3).tolist()],
                 "overrides": {"1": np.array([[1, 0, 5], [0, 1, 3]], np.float32).tolist()},
                 "points": {"1": {"ref": [[1, 2], [3, 4], [5, 6]], "src": [[1, 2], [3, 4], [5, 6]]}},
+                "reference_idx": 2,
             }
         },
     }
@@ -207,3 +251,5 @@ def test_session_round_trip(tmp_path):
     ov = overrides_from_session(loaded)
     assert 1 in ov["VisitA"]
     assert np.allclose(ov["VisitA"][1], np.array([[1, 0, 5], [0, 1, 3]], np.float32))
+    refs = reference_indices_from_session(loaded)
+    assert refs["VisitA"] == 2

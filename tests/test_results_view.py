@@ -88,6 +88,48 @@ def test_results_view_dropdown_and_review(tmp_path):
     assert captured.get("image_num") == 3
     assert captured.get("visit") == "Visit1"
 
+    # Second entry: change dropdown value without relying on stale state alone.
+    # Simulates returning from manual editor then picking another image.
+    image_dd.value = "2"
+    # Even if on_select were skipped, Review must read the live dropdown.
+    review_btn.on_click(None)
+    assert captured.get("image_num") == 2
+
     back_btn = next(n for n in nodes if isinstance(n, ft.IconButton))
     back_btn.on_click(None)
     assert captured.get("back") is True
+
+
+def test_results_view_initial_image_num(tmp_path):
+    out = tmp_path / "Patient"
+    out.mkdir()
+    rng = np.random.default_rng(1)
+    for i in range(1, 5):
+        img = rng.integers(0, 255, (32, 32)).astype(np.uint8)
+        tifffile.imwrite(str(out / f"P-Avg-Stack_Visit1_image{i}.tif"), img)
+
+    fake_page = types.SimpleNamespace(update=lambda: None)
+    captured = {}
+    view = create_results_view(
+        fake_page,
+        str(out),
+        on_back=lambda: None,
+        on_review_correct=lambda image_num, visit: captured.update(
+            {"image_num": image_num, "visit": visit}
+        ),
+        initial_image_num=2,
+    )
+    nodes = list(_walk(view))
+    image_dd = next(
+        n for n in nodes if isinstance(n, ft.Dropdown) and n.label == "Result image"
+    )
+    assert image_dd.value == "2"
+    review_btn = next(
+        n for n in nodes
+        if isinstance(n, ft.FilledButton)
+        and getattr(n, "content", None) == "Review & Correct"
+    )
+    # Change to image4 on the control, then Review without calling on_select.
+    image_dd.value = "4"
+    review_btn.on_click(None)
+    assert captured["image_num"] == 4
