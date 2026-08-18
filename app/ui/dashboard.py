@@ -420,6 +420,7 @@ def create_dashboard(page: ft.Page, mount_view=None):
         points_by_visit,
         excluded_by_visit=None,
         target_layers=None,
+        ref_changed_visits=None,
     ):
         plans = review_state["plans"]
         if not plans:
@@ -431,6 +432,9 @@ def create_dashboard(page: ft.Page, mount_view=None):
         focus_layer = review_state.get("focus_layer")
         focus_visit = review_state.get("focus_visit")
         excluded_by_visit = excluded_by_visit or {}
+        ref_changed_visits = [
+            str(v) for v in (ref_changed_visits or []) if v is not None and str(v)
+        ]
         _last_progress_ts[0] = 0.0
         go_dashboard()
         focus_label = (
@@ -440,7 +444,7 @@ def create_dashboard(page: ft.Page, mount_view=None):
             scope_label = "all result images of this Visit"
         else:
             scope_label = ", ".join(f"image{i + 1}" for i in target_layers)
-        # Same Visit: rewrite either all result images or the selected pair only.
+        # Same Visit(s): rewrite either all result images or the selected pair only.
         # Other Visits are never re-finalized here.
         schedule_log(
             f"--- Finalizing: applying {focus_label} registration params "
@@ -456,14 +460,20 @@ def create_dashboard(page: ft.Page, mount_view=None):
                 os.makedirs(patient_output_dir, exist_ok=True)
                 review_state["patient_output_dir"] = patient_output_dir
 
-                # Only the Visit being edited — never re-synthesize sibling Visits.
-                edited_names = set(overrides_by_visit or {}) | set(excluded_by_visit or {})
-                if focus_visit:
-                    plans_to_run = [p for p in plans if p.visit_name == focus_visit]
-                elif edited_names:
+                # Prefer Visits that were actually edited (overrides, exclusions, or
+                # alignment-reference change). Never fall back to "first plan" — that
+                # can rewrite the wrong Visit after a reference-only Finalize.
+                edited_names = (
+                    set(overrides_by_visit or {})
+                    | set(excluded_by_visit or {})
+                    | set(ref_changed_visits)
+                )
+                if edited_names:
                     plans_to_run = [p for p in plans if p.visit_name in edited_names]
+                elif focus_visit:
+                    plans_to_run = [p for p in plans if p.visit_name == focus_visit]
                 else:
-                    plans_to_run = list(plans)[:1]
+                    plans_to_run = []
 
                 if not plans_to_run:
                     schedule_log("ERROR: No Visit selected to finalize.", color=ft.Colors.RED_400)

@@ -267,10 +267,17 @@ def test_manual_view_change_reference_capture(tmp_path):
     )
     captured = {}
 
-    def on_finalize(overrides_by_visit, points_by_visit, excluded_by_visit=None):
+    def on_finalize(
+        overrides_by_visit,
+        points_by_visit,
+        excluded_by_visit=None,
+        target_layers=None,
+        ref_changed_visits=None,
+    ):
         captured["overrides"] = overrides_by_visit
         captured["excluded"] = excluded_by_visit or {}
         captured["ref"] = plan.reference_idx
+        captured["ref_changed_visits"] = list(ref_changed_visits or [])
 
     view = create_manual_align_view(
         fake_page, [plan], on_back=lambda: None, on_finalize=on_finalize,
@@ -316,3 +323,113 @@ def test_manual_view_change_reference_capture(tmp_path):
     buttons["Finalize all images"].on_click(None)
     assert captured.get("ref") == 1
     assert 0 in captured["overrides"][plan.visit_name]
+    assert plan.visit_name in captured["ref_changed_visits"]
+
+
+def test_manual_view_reference_only_finalize_reports_visit(tmp_path):
+    """Reference-only Finalize must pass the realigned Visit, not rely on overrides."""
+    visit = tmp_path / "visit"
+    _write_visit(str(visit), n_captures=3, n_layers=2)
+    plan = prepare_visit(str(visit))
+
+    fake_page = types.SimpleNamespace(
+        update=lambda: None, width=1280, on_resize=None, window=None,
+    )
+    captured = {}
+
+    def on_finalize(
+        overrides_by_visit,
+        points_by_visit,
+        excluded_by_visit=None,
+        target_layers=None,
+        ref_changed_visits=None,
+    ):
+        captured["overrides"] = overrides_by_visit
+        captured["ref_changed_visits"] = list(ref_changed_visits or [])
+
+    view = create_manual_align_view(
+        fake_page, [plan], on_back=lambda: None, on_finalize=on_finalize,
+        focus_layer=0,
+    )
+    ref_dd = next(
+        n for n in _walk(view)
+        if isinstance(n, ft.Dropdown) and n.label == "Alignment reference"
+    )
+    ref_dd.value = "1"
+    ref_dd.on_select(None)
+    assert plan.reference_idx == 1
+
+    buttons = {
+        getattr(n, "content", None): n
+        for n in _walk(view)
+        if isinstance(n, (ft.FilledButton, ft.OutlinedButton, ft.FilledTonalButton))
+    }
+    buttons["Finalize all images"].on_click(None)
+    assert captured["overrides"] == {}
+    assert captured["ref_changed_visits"] == [plan.visit_name]
+
+
+def test_manual_view_blocks_visit_switch_while_realigning(tmp_path):
+    """Visit / Capture clicks are ignored while reference re-registration is in flight."""
+    visit_a = tmp_path / "VisitA"
+    visit_b = tmp_path / "VisitB"
+    _write_visit(str(visit_a), n_captures=3, n_layers=2)
+    _write_visit(str(visit_b), n_captures=3, n_layers=2)
+    plan_a = prepare_visit(str(visit_a))
+    plan_b = prepare_visit(str(visit_b))
+
+    started = {}
+
+    def fake_run_thread(fn):
+        # Leave realign "in flight" — do not run the worker yet.
+        started["pending"] = fn
+
+    fake_page = types.SimpleNamespace(
+        update=lambda: None,
+        width=1280,
+        on_resize=None,
+        window=None,
+        run_thread=fake_run_thread,
+    )
+    view = create_manual_align_view(
+        fake_page, [plan_a, plan_b], on_back=lambda: None,
+        on_finalize=lambda *a, **k: None,
+        focus_layer=0,
+    )
+    ref_dd = next(
+        n for n in _walk(view)
+        if isinstance(n, ft.Dropdown) and n.label == "Alignment reference"
+    )
+    visit_buttons = {
+        getattr(n, "content", None): n
+        for n in _walk(view)
+        if isinstance(n, ft.FilledTonalButton)
+        and getattr(n, "content", None) in ("VisitA", "VisitB")
+    }
+    assert "VisitA" in visit_buttons and "VisitB" in visit_buttons
+
+    ref_dd.value = "1"
+    ref_dd.on_select(None)
+    assert "pending" in started
+    assert ref_dd.disabled is True
+    assert visit_buttons["VisitB"].disabled is True
+
+    # Attempt to switch Visit / Capture while locked — must be ignored.
+    visit_buttons["VisitB"].on_click(None)
+    capture_rows = [
+        n for n in _walk(view)
+        if isinstance(n, ft.Container) and getattr(n, "on_click", None) is not None
+    ]
+    assert capture_rows
+    capture_rows[1].on_click(None)
+
+    # Finish the background realign.
+    started["pending"]()
+    assert ref_dd.disabled is False
+    assert visit_buttons["VisitB"].disabled is False
+    assert plan_a.reference_idx == 1
+    texts = [
+        getattr(n, "value", "") or ""
+        for n in _walk(view) if isinstance(n, ft.Text)
+    ]
+    assert any("Auto-registered to Capture 2" in t for t in texts)
