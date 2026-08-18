@@ -166,6 +166,8 @@ def create_manual_align_view(
         "selected": None,
         "dragging": False,
         "suppress_add": False,
+        # True while background realign_plan_to_reference is running.
+        "realigning": False,
     }
 
     def _ref_idx(visit: str | None = None) -> int:
@@ -606,6 +608,8 @@ def create_manual_align_view(
         )
 
     def select_capture(idx):
+        if state.get("realigning"):
+            return
         state["capture"] = idx
         preview_img.src = _PREVIEW_PLACEHOLDER_PNG
         cc_text.value = ""
@@ -666,11 +670,20 @@ def create_manual_align_view(
         refresh_capture_list()
         render_images()
 
+    def _set_realign_locked(locked: bool):
+        """Block Visit / Capture / Finalize while reference re-registration runs."""
+        state["realigning"] = bool(locked)
+        ref_dropdown.disabled = bool(locked)
+        for btn in visit_row.controls:
+            btn.disabled = bool(locked)
+
     def change_reference(new_ref: int):
         """
         Re-run automatic registration onto ``new_ref`` for the focus image only,
         then refresh the manual corresponding-point editor.
         """
+        if state.get("realigning"):
+            return
         visit = state["visit"]
         plan = plans_by_name[visit]
         new_ref = int(new_ref)
@@ -688,7 +701,7 @@ def create_manual_align_view(
             f"({layer_label} of this Visit only)…"
         )
         cc_text.value = ""
-        ref_dropdown.disabled = True
+        _set_realign_locked(True)
         try:
             page.update()
         except Exception:
@@ -701,6 +714,8 @@ def create_manual_align_view(
             logs.append(str(msg))
 
         def _apply_success():
+            # Always refresh the Visit we realigned, even if UI state drifted.
+            state["visit"] = visit
             overrides[visit].clear()
             ref_by_visit[visit] = int(plan.reference_idx)
             for key in list(points.keys()):
@@ -728,7 +743,7 @@ def create_manual_align_view(
                 ref_caption.value = _ref_label(plan)
                 src_caption.value = "Source"
             else:
-                # Avoid nested page.update from select_capture until enabled again.
+                # Avoid nested page.update from select_capture until unlocked.
                 select_capture(cap)
 
         def _run_realign():
@@ -742,7 +757,7 @@ def create_manual_align_view(
             )
 
         def _finish_ok():
-            ref_dropdown.disabled = False
+            _set_realign_locked(False)
             _apply_success()
             try:
                 page.update()
@@ -750,7 +765,7 @@ def create_manual_align_view(
                 pass
 
         def _finish_err(exc: BaseException):
-            ref_dropdown.disabled = False
+            _set_realign_locked(False)
             ref_dropdown.value = str(old_ref)
             status_text.value = (
                 f"Auto-registration to Capture {new_ref + 1} failed: {exc}"
@@ -803,6 +818,8 @@ def create_manual_align_view(
             pass
 
     def select_visit(name):
+        if state.get("realigning"):
+            return
         state["visit"] = name
         state["capture"] = None
         state.pop("_pending_matrix", None)
@@ -1232,36 +1249,51 @@ def create_manual_align_view(
         this Visit" behaviour. Pair buttons pass e.g. ``[0, 1]`` for
         image1+image2 only.
         """
+        if state.get("realigning"):
+            status_text.value = (
+                "Reference re-registration is still running — wait for it to finish."
+            )
+            page.update()
+            return
         clean_overrides = {v: dict(d) for v, d in overrides.items() if d}
         clean_excluded = {v: sorted(s) for v, s in excluded.items() if s}
         clean_points = {}
         for (visit, cap), pt in points.items():
             if visit in clean_overrides and cap in clean_overrides[visit]:
                 clean_points.setdefault(visit, {})[cap] = pt
-        ref_changed = any(
-            ref_by_visit[v] != initial_ref_by_visit.get(v, 0)
-            for v in ref_by_visit
+        ref_changed_visits = sorted(
+            v for v in ref_by_visit
+            if ref_by_visit[v] != initial_ref_by_visit.get(v, 0)
         )
-        if not clean_overrides and not clean_excluded and not ref_changed:
+        if not clean_overrides and not clean_excluded and not ref_changed_visits:
             status_text.value = (
                 "No corrections, exclusions, or reference change yet. "
                 "Accept a preview, Exclude a capture, or change the reference."
             )
             page.update()
             return
-        # Prefer (overrides, points, excluded, target_layers); fall back for older hooks.
+        # Prefer kwargs for target_layers / ref_changed_visits; fall back for older hooks.
         try:
             on_finalize(
                 clean_overrides,
                 clean_points,
                 clean_excluded,
                 target_layers=target_layers,
+                ref_changed_visits=ref_changed_visits,
             )
         except TypeError:
             try:
-                on_finalize(clean_overrides, clean_points, clean_excluded)
+                on_finalize(
+                    clean_overrides,
+                    clean_points,
+                    clean_excluded,
+                    target_layers=target_layers,
+                )
             except TypeError:
-                on_finalize(clean_overrides, clean_points)
+                try:
+                    on_finalize(clean_overrides, clean_points, clean_excluded)
+                except TypeError:
+                    on_finalize(clean_overrides, clean_points)
 
     def _layer_count_for_finalize():
         plan = plans_by_name[state["visit"]]
