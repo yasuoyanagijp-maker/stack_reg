@@ -1,6 +1,6 @@
 [project]
 name = "stack-reg"
-version = "1.3.0"
+version = "1.4.0"
 description = "ARIAKE OCTA Stack Registration Tool"
 requires-python = ">=3.10"
 dependencies = [

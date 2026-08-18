@@ -126,8 +126,8 @@ $env:FLET_CLI_NO_RICH_OUTPUT = "1"
 
 | 種類 | パス |
 |------|------|
-| フォルダ（そのまま配布可） | `dist\ARIAKE_OCTA_Stack_Registration_v0.1.0_win64\` |
-| ZIP（配布用） | `dist\ARIAKE_OCTA_Stack_Registration_v0.1.0_win64.zip` |
+| フォルダ（そのまま配布可） | `dist\ARIAKE_OCTA_Stack_Registration_v1.4.0_win64\` |
+| ZIP（配布用） | `dist\ARIAKE_OCTA_Stack_Registration_v1.4.0_win64.zip` |
 
 エンドユーザーは ZIP を解凍し、`ARIAKE_OCTA_Stack_Registration.exe` を実行します（Python 不要）。
 
