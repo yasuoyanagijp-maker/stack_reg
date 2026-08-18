@@ -100,6 +100,48 @@ def test_results_view_dropdown_and_review(tmp_path):
     assert captured.get("back") is True
 
 
+def test_results_view_preserves_visit_on_image_change(tmp_path):
+    """Changing Result image must keep the selected Visit (not jump to first)."""
+    out = tmp_path / "Patient"
+    out.mkdir()
+    rng = np.random.default_rng(2)
+    for visit in ("VisitA", "VisitB"):
+        for i in range(1, 5):
+            img = rng.integers(0, 255, (32, 32)).astype(np.uint8)
+            tifffile.imwrite(str(out / f"P-Avg-Stack_{visit}_image{i}.tif"), img)
+
+    fake_page = types.SimpleNamespace(update=lambda: None)
+    view = create_results_view(
+        fake_page,
+        str(out),
+        on_back=lambda: None,
+        on_review_correct=lambda image_num, visit: None,
+    )
+    nodes = list(_walk(view))
+    image_dd = next(
+        n for n in nodes if isinstance(n, ft.Dropdown) and n.label == "Result image"
+    )
+    visit_dd = next(
+        n for n in nodes if isinstance(n, ft.Dropdown) and n.label == "Visit"
+    )
+    assert visit_dd.visible is True
+    assert visit_dd.value == "VisitA"
+
+    visit_dd.value = "VisitB"
+    visit_dd.on_select(None)
+    assert visit_dd.value == "VisitB"
+
+    image_dd.value = "3"
+    image_dd.on_select(None)
+    assert visit_dd.value == "VisitB"
+    fname_texts = [
+        getattr(n, "value", "") or ""
+        for n in _walk(view)
+        if isinstance(n, ft.Text) and (getattr(n, "value", "") or "").endswith(".tif")
+    ]
+    assert any("VisitB" in t and "image3" in t for t in fname_texts)
+
+
 def test_results_view_initial_image_num(tmp_path):
     out = tmp_path / "Patient"
     out.mkdir()

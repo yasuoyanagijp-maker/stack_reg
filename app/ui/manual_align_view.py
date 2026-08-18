@@ -1223,7 +1223,15 @@ def create_manual_align_view(
         state["show_diag"] = bool(e.control.value)
         render_images()
 
-    def finalize_click(e):
+    def finalize_click(e, target_layers=None):
+        """
+        Commit corrections.
+
+        ``target_layers`` is a 0-based layer list passed to the dashboard
+        finalize path. ``None`` keeps the legacy "rewrite every result image of
+        this Visit" behaviour. Pair buttons pass e.g. ``[0, 1]`` for
+        image1+image2 only.
+        """
         clean_overrides = {v: dict(d) for v, d in overrides.items() if d}
         clean_excluded = {v: sorted(s) for v, s in excluded.items() if s}
         clean_points = {}
@@ -1241,11 +1249,34 @@ def create_manual_align_view(
             )
             page.update()
             return
-        # Prefer 3-arg callback (overrides, points, excluded); fall back for older hooks.
+        # Prefer (overrides, points, excluded, target_layers); fall back for older hooks.
         try:
-            on_finalize(clean_overrides, clean_points, clean_excluded)
+            on_finalize(
+                clean_overrides,
+                clean_points,
+                clean_excluded,
+                target_layers=target_layers,
+            )
         except TypeError:
-            on_finalize(clean_overrides, clean_points)
+            try:
+                on_finalize(clean_overrides, clean_points, clean_excluded)
+            except TypeError:
+                on_finalize(clean_overrides, clean_points)
+
+    def _layer_count_for_finalize():
+        plan = plans_by_name[state["visit"]]
+        caps = plan.sorted_captures
+        if not caps:
+            return 0
+        return len(plan.folder_contents[caps[0]])
+
+    def _pair_layer_targets():
+        """Odd/even result-image pairs: (image1,image2), (image3,image4), …"""
+        n = _layer_count_for_finalize()
+        pairs = []
+        for start in range(0, n - 1, 2):
+            pairs.append((start, start + 1))
+        return pairs
 
     ref_dropdown.on_select = on_ref_dropdown_select
 
@@ -1383,16 +1414,46 @@ def create_manual_align_view(
         page.on_resize = _prev_on_resize
         on_back()
 
+    pair_finalize_buttons = []
+    for layer_a, layer_b in _pair_layer_targets():
+        img_a, img_b = layer_a + 1, layer_b + 1
+        pair_finalize_buttons.append(
+            ft.FilledTonalButton(
+                content=(
+                    f"Finalize image{img_a}+image{img_b} only"
+                ),
+                icon=ft.Icons.SAVE_AS,
+                tooltip=(
+                    f"Re-apply registration with image{img_a} as the reviewed "
+                    f"reference scope — rewrite only image{img_a} and image{img_b} "
+                    f"for this Visit."
+                ),
+                on_click=lambda e, layers=[layer_a, layer_b]: finalize_click(
+                    e, target_layers=layers
+                ),
+            )
+        )
+
+    finalize_all_btn = ft.FilledButton(
+        "Finalize all images",
+        icon=ft.Icons.SAVE,
+        style=ft.ButtonStyle(bgcolor=ft.Colors.CYAN_700, color=ft.Colors.WHITE),
+        tooltip=(
+            "Apply corrections to every result image (image1–N) of this Visit "
+            "(legacy behaviour)."
+        ),
+        on_click=lambda e: finalize_click(e, target_layers=None),
+    )
+
     header = ft.Row([
         ft.IconButton(icon=ft.Icons.ARROW_BACK, tooltip="Back",
                       on_click=_go_back),
         ft.Text(f"Manual Corresponding-Point Correction{title_suffix}", size=22,
                 weight=ft.FontWeight.BOLD, color=ft.Colors.CYAN_400),
         ft.Container(expand=True),
-        ft.FilledButton("Finalize & Save", icon=ft.Icons.SAVE,
-                        style=ft.ButtonStyle(bgcolor=ft.Colors.CYAN_700, color=ft.Colors.WHITE),
-                        on_click=finalize_click),
-    ])
+        *pair_finalize_buttons,
+        finalize_all_btn,
+    ], wrap=True, spacing=8)
 
     view = ft.Column([
         header,

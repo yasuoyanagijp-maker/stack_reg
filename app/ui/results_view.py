@@ -135,8 +135,8 @@ def create_results_view(
             filename_label.value = os.path.basename(path)
             status.value = (
                 "Visually inspect the stack. Choose image1–image4, then Review & Correct "
-                "to open manual alignment for that image. Corrected parameters are applied "
-                "to all result images on Finalize."
+                "to open manual alignment for that image. On Finalize you can apply "
+                "corrections to one image pair or to all result images of this Visit."
             )
             status.color = ft.Colors.GREY_400
         except Exception as ex:
@@ -156,7 +156,9 @@ def create_results_view(
             return
         state["image_num"] = int(raw)
         image_dd.value = str(state["image_num"])
-        state["visit"] = None
+        # Keep the current Visit when switching Result image / Capture.
+        # Only fall back (in refresh_preview) if that Visit has no file for the
+        # newly selected image.
         refresh_preview()
 
     def on_visit_change(e=None):

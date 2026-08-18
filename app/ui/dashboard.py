@@ -415,7 +415,12 @@ def create_dashboard(page: ft.Page, mount_view=None):
         # Do not schedule_log here: journal is unmounted on the results screen.
         page.run_task(open_manual_view, edit_plans, focus_layer)
 
-    def handle_finalize(overrides_by_visit, points_by_visit, excluded_by_visit=None):
+    def handle_finalize(
+        overrides_by_visit,
+        points_by_visit,
+        excluded_by_visit=None,
+        target_layers=None,
+    ):
         plans = review_state["plans"]
         if not plans:
             return
@@ -431,11 +436,15 @@ def create_dashboard(page: ft.Page, mount_view=None):
         focus_label = (
             f"image{focus_layer + 1}" if focus_layer is not None else "manual points"
         )
-        # Same Visit: rewrite all result images (image1–N) with these capture matrices.
+        if target_layers is None:
+            scope_label = "all result images of this Visit"
+        else:
+            scope_label = ", ".join(f"image{i + 1}" for i in target_layers)
+        # Same Visit: rewrite either all result images or the selected pair only.
         # Other Visits are never re-finalized here.
         schedule_log(
             f"--- Finalizing: applying {focus_label} registration params "
-            "to all result images of this Visit only (other Visits untouched) ---"
+            f"to {scope_label} only (other Visits untouched) ---"
         )
 
         def work():
@@ -478,7 +487,7 @@ def create_dashboard(page: ft.Page, mount_view=None):
                             automate_tuning=auto_tuning_val,
                             matrix_overrides=ov,
                             source_layer=focus_layer,
-                            target_layers=None,  # all layers of this Visit
+                            target_layers=target_layers,
                             excluded_captures=excl,
                             persist_overrides=True,
                             progress_callback=fin_cb,
@@ -490,7 +499,7 @@ def create_dashboard(page: ft.Page, mount_view=None):
                     else:
                         success = True
                         schedule_log(
-                            f"Saved all layers for "
+                            f"Saved {scope_label} for "
                             f"{', '.join(p.visit_name for p in plans_to_run)} "
                             f"→ {patient_output_dir}."
                         )
