@@ -45,8 +45,9 @@ Retinal OCTA 画像スタックのレジストレーションと平均化のた�
    自動に戻すなら `Revert to auto` / `Reset to auto points`。
    画質が悪く重ねられない場合は **`Exclude / Include`** で平均から除外できます
    （**Capture 1（参照）も除外可能**。ただし平均に残すキャプチャは1枚以上必要）。
-5. `Finalize & Save` は、選んだ image 上で決めたキャプチャ整列を
-   **その Visit の image1–imageN 全部** に適用して再合成します。
+5. `Finalize` では、選んだ image 上で決めたキャプチャ整列を
+   **その Visit の image ペアのみ**（例: image1+image2、image3+image4）に
+   適用するか、**image1–imageN 全部**に適用するかを選べます。
    **他の Visit は再合成しません。**
 
 ピンは 3 点で厳密解、4 点以上では最小二乗（LMEDS でロバスト推定）になります（上限 8）。

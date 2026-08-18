@@ -74,7 +74,7 @@ def test_manual_view_labels_omit_redundant_folder(tmp_path):
         fake_page, [plan], on_back=lambda: None, on_finalize=lambda *a, **k: None,
     )
     texts = [
-        getattr(n, "value", "") or getattr(n, "text", "") or ""
+        str(getattr(n, "value", "") or getattr(n, "text", "") or "")
         for n in _walk(view)
     ]
     assert not any("Capture 1 — 1" in t for t in texts)
@@ -114,7 +114,7 @@ def test_manual_view_full_interaction(tmp_path):
                if isinstance(n, (ft.FilledButton, ft.OutlinedButton, ft.FilledTonalButton))}
     assert "Compute & Preview" in buttons
     assert "Accept" in buttons
-    assert "Finalize & Save" in buttons
+    assert "Finalize all images" in buttons
     assert "Clear points" in buttons
     assert "Delete selected" in buttons
     assert "Drop outliers & refit" in buttons
@@ -138,7 +138,7 @@ def test_manual_view_full_interaction(tmp_path):
 
     buttons["Compute & Preview"].on_click(None)
     buttons["Accept"].on_click(None)
-    buttons["Finalize & Save"].on_click(None)
+    buttons["Finalize all images"].on_click(None)
 
     assert "overrides" in captured
     ov = captured["overrides"]
@@ -205,6 +205,55 @@ def test_manual_view_focus_layer_and_overlay_gallery(tmp_path):
     assert len(gallery_imgs) >= 3
 
 
+def test_manual_view_pair_finalize_buttons(tmp_path):
+    """Pair-only Finalize buttons pass target_layers; all-images keeps None."""
+    visit = tmp_path / "visit"
+    _write_visit(str(visit), n_captures=3, n_layers=4)
+    plan = prepare_visit(str(visit))
+
+    fake_page = types.SimpleNamespace(
+        update=lambda: None, width=1280, on_resize=None, window=None,
+    )
+    captured = {}
+
+    def on_finalize(
+        overrides_by_visit,
+        points_by_visit,
+        excluded_by_visit=None,
+        target_layers=None,
+    ):
+        captured["overrides"] = overrides_by_visit
+        captured["target_layers"] = target_layers
+
+    view = create_manual_align_view(
+        fake_page, [plan], on_back=lambda: None, on_finalize=on_finalize,
+        focus_layer=0,
+    )
+    nodes = list(_walk(view))
+    buttons = {
+        getattr(n, "content", None): n
+        for n in nodes
+        if isinstance(n, (ft.FilledButton, ft.OutlinedButton, ft.FilledTonalButton))
+    }
+    assert "Finalize image1+image2 only" in buttons
+    assert "Finalize image3+image4 only" in buttons
+    assert "Finalize all images" in buttons
+
+    capture_rows = [
+        n for n in nodes
+        if isinstance(n, ft.Container) and getattr(n, "on_click", None) is not None
+    ]
+    capture_rows[1].on_click(None)
+    buttons["Accept"].on_click(None)
+
+    buttons["Finalize image3+image4 only"].on_click(None)
+    assert captured["target_layers"] == [2, 3]
+    assert plan.visit_name in captured["overrides"]
+
+    buttons["Finalize all images"].on_click(None)
+    assert captured["target_layers"] is None
+
+
 def test_manual_view_change_reference_capture(tmp_path):
     """Dropdown re-runs auto-registration for the focus image; Capture 1 becomes editable."""
     visit = tmp_path / "visit"
@@ -264,6 +313,6 @@ def test_manual_view_change_reference_capture(tmp_path):
     # Capture 1 (index 0) is no longer the reference — Accept should work.
     capture_rows[0].on_click(None)
     buttons["Accept"].on_click(None)
-    buttons["Finalize & Save"].on_click(None)
+    buttons["Finalize all images"].on_click(None)
     assert captured.get("ref") == 1
     assert 0 in captured["overrides"][plan.visit_name]
