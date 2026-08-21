@@ -1477,15 +1477,24 @@ def create_manual_align_view(
         on_click=lambda e: finalize_click(e, target_layers=None),
     )
 
-    header = ft.Row([
+    # Title row: expand spacer is safe without wrap. Pair Finalize buttons sit on
+    # a second row so Wrap+Expanded never coexist (v1.4 all-gray regression).
+    title_row = ft.Row([
         ft.IconButton(icon=ft.Icons.ARROW_BACK, tooltip="Back",
                       on_click=_go_back),
         ft.Text(f"Manual Corresponding-Point Correction{title_suffix}", size=22,
                 weight=ft.FontWeight.BOLD, color=ft.Colors.CYAN_400),
         ft.Container(expand=True),
-        *pair_finalize_buttons,
         finalize_all_btn,
-    ], wrap=True, spacing=8)
+    ], spacing=8)
+
+    pair_row = ft.Row(pair_finalize_buttons, wrap=True, spacing=8) if pair_finalize_buttons else None
+
+    header = ft.Column(
+        [c for c in (title_row, pair_row) if c is not None],
+        spacing=4,
+        tight=True,
+    )
 
     view = ft.Column([
         header,
